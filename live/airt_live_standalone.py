@@ -2,21 +2,9 @@
 """
 Standalone AIR8201 live spectrogram + PSD viewer -- single machine, no network.
 
-This merges the striqt radio backend (formerly airt_live_server_striqt.py) and
-the Qt viewer UI (formerly finalviewer.py) into one process. There is NO TCP:
-no socket, no server/client, no JSON wire protocol. An Acquirer thread reads raw
-IQ from the radio into a ring buffer; a LocalReceiver QThread pulls the latest
-samples in-process, computes calibrated spectrogram blocks, and feeds the same
-Qt UI that the networked viewer used.
-
-UI is unchanged from finalviewer.py: Boring/Cool mode, PSD panel, RX1-RX2 diff,
-peak marker/hold/min, crosshair, pinned band monitor, all controls, CSV/PNG.
-
-Keep this CPU-only for now. CuPy/GPU is intentionally disabled because importing
-CuPy before/around SoapySDR caused a libstdc++ / GLIBCXX conflict on the AIR-T.
-
-Run (needs the AIR-T hardware + installed striqt + PyQt5/pyqtgraph):
-    python3 airt_live_standalone.py
+This merges the striqt radio backend (airt_live_server_striqt.py) and
+the Qt viewer UI (finalviewer.py) into one process. There is NO TCP:
+no socket, no server/client, no JSON wire protocol.
 """
 
 import csv
