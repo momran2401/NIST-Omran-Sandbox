@@ -2,11 +2,7 @@
 """
 striqt-backed AIR8201 live server.
 
-Runs on the Deepwave AIR-T / AIR8201-B and streams spectrogram frames to the Mac
-viewer over TCP.
-
-Keep this CPU-only for now. CuPy/GPU is intentionally disabled because importing
-CuPy before/around SoapySDR caused a libstdc++ / GLIBCXX conflict on the AIR-T.
+Runs on the Deepwave AIR-T / AIR8201-B and streams spectrogram frames to a separate viewer (finalviewer.py) over TCP.
 """
 
 import json
