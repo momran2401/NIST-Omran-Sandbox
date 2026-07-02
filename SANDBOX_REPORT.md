@@ -266,3 +266,66 @@ Phase 4 checks:
 - Source settings are gated as reconnect-required and skipped low-level source params are not rendered.
 - A second WebSocket is refused.
 - No real SDR hardware was touched.
+
+## Phase 4.5 - Real-Hardware Validation Window
+
+### 2026-07-02T13:54:24-06:00
+
+Operator-controlled service protocol:
+
+- Per operator instruction, no `sudo` commands were run by the agent.
+- Per operator instruction, the agent did not start, stop, restart, or inspect `radio-web.service`.
+- Operator signaled `live service stopped` before the sandbox hardware test.
+- Operator later signaled `radio-web is back up, confirmed`.
+
+Downtime window:
+
+- First recorded timestamp immediately after the operator's stop signal: `2026-07-02T13:52:16-06:00`.
+- Operator restart confirmation recorded locally at: `2026-07-02T13:54:24-06:00`.
+- Signal-to-signal elapsed window recorded from available timestamps: about `2m 08s`. The actual public-service downtime may differ by the few seconds between the operator's shell actions and the chat/tool timestamps.
+
+Commands run:
+
+- Radio: started sandbox only, not demo, on `127.0.0.1:8001` with temporary non-secret auth values:
+  `/home/sensor/.pixi/bin/pixi run --manifest-path /home/sensor/aggregate-directivity-acquisition/pixi.toml python live/striqt_web_server.py --backend calibrated --host 127.0.0.1 --port 8001 --fps 15`
+- Radio: HTTP auth checks on `http://127.0.0.1:8001/`.
+- Radio: pixi Python WebSocket validation client for real frames, frame metrics, and live retune.
+- Radio: log scan for `overflow|dma|error|exception|traceback|failed`.
+- Radio: terminated the sandbox process, then verified `8001` was free and the sandbox process was stopped.
+
+Real-hardware results:
+
+- Sandbox start timestamp: `2026-07-02T13:52:16-06:00`.
+- Sandbox log path: `/home/sensor/NIST-Omran-Sandbox/phase45_real_20260702T135216-0600.log`.
+- Sandbox PID during validation: `10360`.
+- HTTP auth gate:
+  - no credentials: `401`
+  - temporary test credentials: `200`
+- First real frame header:
+  - `backend=calibrated`
+  - center `1955000000.0`
+  - sample rate `15360000.0`
+  - gain `0.0`
+  - channels `[0,1]`
+  - shape `[12,147]`
+- Averaged striqt path active: yes, because calibrated backend was active and output bins were `147` rather than the quicklook `1024`.
+- Both RX channels present: yes.
+- Real-signal roughness metric: `0.4815008504036239`.
+- Retune target: center `1956000000.0`, gain `-2.0`.
+- Retune result: subsequent real frame reflected center `1956000000.0`, gain `-2.0`; `retune_ok=true`.
+- Frame count in the initial 5-second window was `1`; retune still returned a new frame quickly. Real-hardware frame cadence was slower than demo during this short window, so visual smoothness remains a browser/human confirmation item.
+- Log scan found no overflow/DMA/error matches during validation. The only later log errors were Starlette lifespan `CancelledError` messages caused by intentionally terminating the short-lived sandbox server after validation.
+- Sandbox stopped: yes.
+- Port `8001` free after validation: yes.
+- SDR release confirmed by sandbox process stop and port release before the operator restarted `radio-web`.
+- Operator confirmed original `radio-web` was back up after restart.
+
+Phase 4.5 checks:
+
+- Real hardware frames streamed from the sandbox.
+- Both RX channels were present.
+- Live center-frequency/gain retune took effect.
+- Averaged calibrated striqt path was active.
+- No overflow/DMA errors were found in the validation log scan.
+- Sandbox no longer contends for hardware.
+- Original live service restart was handled only by the operator and confirmed back up.
