@@ -404,7 +404,7 @@ class RadioConfig:
 class SharedConfig:
     def __init__(self):
         self._lock  = threading.Lock()
-        self._cfg   = RadioConfig()
+        self._cfg   = RadioConfig(backend=SPEC_BACKEND)
         self._dirty = False
         self._stop  = False
 
