@@ -1,0 +1,18 @@
+[Unit]
+Description=AIR-T sandbox RF web viewer
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=sensor
+WorkingDirectory=/home/sensor/NIST-Omran-Sandbox
+EnvironmentFile=/etc/radio-web.env
+ExecStart=/home/sensor/.pixi/bin/pixi run --manifest-path /home/sensor/aggregate-directivity-acquisition/pixi.toml python /home/sensor/NIST-Omran-Sandbox/live/striqt_web_server.py --demo --backend calibrated --host 0.0.0.0 --port 8001
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

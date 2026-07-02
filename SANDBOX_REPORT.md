@@ -329,3 +329,51 @@ Phase 4.5 checks:
 - No overflow/DMA errors were found in the validation log scan.
 - Sandbox no longer contends for hardware.
 - Original live service restart was handled only by the operator and confirmed back up.
+
+## Phase 5a - Private Sandbox Service
+
+### 2026-07-02T13:58:00-06:00
+
+Status: blocked on privileged systemd installation.
+
+Commands/files:
+
+- Local file created inside the sandbox repo: `deploy/radio-web-sandbox.service`.
+- No `sudo` commands were run.
+- No systemd files were created or modified on the radio.
+- No original services were touched.
+
+Prepared unit:
+
+- Service name: `radio-web-sandbox.service`.
+- Working directory: `/home/sensor/NIST-Omran-Sandbox`.
+- Credential source: `EnvironmentFile=/etc/radio-web.env` (references existing auth env file; no secrets copied).
+- ExecStart runs the sandbox under pixi on port `8001`:
+  `/home/sensor/.pixi/bin/pixi run --manifest-path /home/sensor/aggregate-directivity-acquisition/pixi.toml python /home/sensor/NIST-Omran-Sandbox/live/striqt_web_server.py --demo --backend calibrated --host 0.0.0.0 --port 8001`
+- The unit uses `--demo` intentionally so the original live `radio-web` service keeps the SDR hardware.
+
+Blocker:
+
+- Phase 5a requires installing one new systemd unit under `/etc/systemd/system`, enabling it, and starting it.
+- The operator instructed the agent not to run any `sudo` commands.
+- Phase 0 confirmed `sensor` does not have passwordless sudo.
+- Therefore the agent cannot complete Phase 5a autonomously without violating the operator's latest instruction.
+
+Human-run commands to complete Phase 5a:
+
+```bash
+cd /home/sensor/NIST-Omran-Sandbox
+sudo cp deploy/radio-web-sandbox.service /etc/systemd/system/radio-web-sandbox.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now radio-web-sandbox.service
+systemctl status radio-web-sandbox.service --no-pager
+curl -i http://localhost:8001/
+```
+
+After the service is installed, the private test path is expected to be an SSH local port-forward because Tailscale was logged out in Phase 0:
+
+```bash
+ssh -L 8001:localhost:8001 sensor@24.128.57.203
+```
+
+Then browse `http://localhost:8001/` locally with the same radio HTTP Basic credentials.
