@@ -731,10 +731,15 @@ def fit_display_rows(spg: np.ndarray, rows: int) -> np.ndarray:
 def samples_needed(cfg: RadioConfig) -> int:
     nfft = aligned_nfft(cfg.nfft) if cfg.backend in {"calibrated", "ssb"} else cfg.nfft
     base = int(nfft * cfg.rows)
-    if cfg.backend == "ssb":
+    if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate):
         ssb = int(math.ceil(SSB_DISCOVERY_PERIOD * cfg.sample_rate))
         return max(base, ssb)
     return base
+
+
+def ssb_grid_compatible(sample_rate: float) -> bool:
+    nfft = round(2 * float(sample_rate) / SSB_SUBCARRIER_SPACING)
+    return nfft > 0 and (13 * nfft) % 28 == 0
 
 
 def compute_blocks(samples: np.ndarray, cfg: RadioConfig) -> np.ndarray:
