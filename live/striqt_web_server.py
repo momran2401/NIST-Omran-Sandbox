@@ -1085,6 +1085,8 @@ class DemoAcquirer(threading.Thread):
         print("[demo] Synthetic IQ mode — no radio hardware used.")
         print("[demo] Two CW tones per channel + noise. Controls work normally.")
 
+        interval = 1.0 / max(BROADCAST_FPS, 1.0)
+        next_t = time.time()
         while not self.shared.stopped():
             cfg = self.shared.snapshot()
             n   = samples_needed(cfg)
@@ -1113,7 +1115,12 @@ class DemoAcquirer(threading.Thread):
             except Exception as e:
                 print(f"[demo] compute error: {e}")
 
-            time.sleep(max(1.0 / BROADCAST_FPS, 0.02))
+            next_t += interval
+            dt = next_t - time.time()
+            if dt > 0:
+                time.sleep(dt)
+            else:
+                next_t = time.time()
 
 
 # ---------------------------------------------------------------------------
