@@ -615,6 +615,7 @@ def calibrated_spectrogram(
         raise RuntimeError(f"calibrated backend unavailable: {_ANALYSIS_ERR!r}")
 
     samples = np.asarray(samples, dtype=np.complex64)
+    nfft = aligned_nfft(nfft)
     needed  = rows * nfft
     if samples.shape[1] < needed:
         pad = np.zeros((samples.shape[0], needed - samples.shape[1]), dtype=np.complex64)
@@ -629,12 +630,13 @@ def calibrated_spectrogram(
         analysis_bandwidth=float("inf"),
     )
     frequency_resolution = sample_rate / float(nfft)
+    average_bins = averaging_factor(nfft)
     spec = analysis_specs.Spectrogram(
         window=("kaiser", 11.88),
         frequency_resolution=frequency_resolution,
         fractional_overlap=Fraction(13, 28),
         window_fill=Fraction(15, 28),
-        integration_bandwidth=frequency_resolution * AVG_BIN_GROUPS,
+        integration_bandwidth=frequency_resolution * average_bins,
         trim_stopband=False,
         lo_bandstop=SSB_LO_BANDSTOP,
     )
@@ -645,7 +647,9 @@ def calibrated_spectrogram(
     return fit_display_rows(np.asarray(spg, dtype=np.float32), rows)
 
 
-def ssb_spectrogram(samples: np.ndarray, rows: int, sample_rate: float) -> np.ndarray:
+def ssb_spectrogram(
+    samples: np.ndarray, nfft: int, rows: int, sample_rate: float
+) -> np.ndarray:
     """
     5G SSB spectrogram path from striqt. The returned SSB block and symbol axes
     are flattened to the dashboard's existing rows x bins frame contract.
@@ -654,28 +658,49 @@ def ssb_spectrogram(samples: np.ndarray, rows: int, sample_rate: float) -> np.nd
         raise RuntimeError(f"SSB backend unavailable: {_ANALYSIS_ERR!r}")
 
     samples = np.asarray(samples, dtype=np.complex64)
+    nfft = aligned_nfft(nfft)
     sample_rate = float(sample_rate)
     capture = analysis_specs.Capture(
         sample_rate=sample_rate,
         duration=samples.shape[1] / sample_rate,
         analysis_bandwidth=float("inf"),
     )
-    spg, _ = striqt_measurements.cellular_5g_ssb_spectrogram(
-        samples,
-        capture,
-        as_xarray=False,
-        subcarrier_spacing=SSB_SUBCARRIER_SPACING,
-        sample_rate=min(SSB_SAMPLE_RATE, sample_rate),
-        discovery_periodicity=SSB_DISCOVERY_PERIOD,
-        frequency_offset=0.0,
-        max_block_count=None,
-        window="blackmanharris",
-        lo_bandstop=SSB_LO_BANDSTOP,
-    )
+    try:
+        spg, _ = striqt_measurements.cellular_5g_ssb_spectrogram(
+            samples,
+            capture,
+            as_xarray=False,
+            subcarrier_spacing=SSB_SUBCARRIER_SPACING,
+            sample_rate=min(SSB_SAMPLE_RATE, sample_rate),
+            discovery_periodicity=SSB_DISCOVERY_PERIOD,
+            frequency_offset=0.0,
+            max_block_count=None,
+            window="blackmanharris",
+            lo_bandstop=SSB_LO_BANDSTOP,
+        )
+    except ValueError as exc:
+        if "counting-number" not in str(exc):
+            raise
+        # The live viewer's power-of-two sample-rate/FFT controls are not
+        # always compatible with the strict 30 kHz SSB grid. Keep the selector
+        # useful by falling back to the same 13/28, 15/28 averaged grid.
+        return calibrated_spectrogram(samples, nfft, rows, sample_rate)
     spg = np.asarray(spg, dtype=np.float32)
     if spg.ndim == 4:
         spg = spg.reshape(spg.shape[0], spg.shape[1] * spg.shape[2], spg.shape[3])
     return fit_display_rows(spg, rows)
+
+
+def aligned_nfft(nfft: int) -> int:
+    nfft = max(28, int(nfft))
+    return max(28, int(round(nfft / 28)) * 28)
+
+
+def averaging_factor(nfft: int) -> int:
+    for factor in range(min(AVG_BIN_GROUPS, nfft), 1, -1):
+        if nfft % factor == 0:
+            return factor
+    return 1
 
 
 def fit_display_rows(spg: np.ndarray, rows: int) -> np.ndarray:
@@ -704,7 +729,8 @@ def fit_display_rows(spg: np.ndarray, rows: int) -> np.ndarray:
 
 
 def samples_needed(cfg: RadioConfig) -> int:
-    base = int(cfg.nfft * cfg.rows)
+    nfft = aligned_nfft(cfg.nfft) if cfg.backend in {"calibrated", "ssb"} else cfg.nfft
+    base = int(nfft * cfg.rows)
     if cfg.backend == "ssb":
         ssb = int(math.ceil(SSB_DISCOVERY_PERIOD * cfg.sample_rate))
         return max(base, ssb)
@@ -719,7 +745,7 @@ def compute_blocks(samples: np.ndarray, cfg: RadioConfig) -> np.ndarray:
     if cfg.backend == "calibrated":
         return calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
     if cfg.backend == "ssb":
-        return ssb_spectrogram(samples, cfg.rows, cfg.sample_rate)
+        return ssb_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
     return db_spectrogram(samples, cfg.nfft, cfg.rows)
 
 
