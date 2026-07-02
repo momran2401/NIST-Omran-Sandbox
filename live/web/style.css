@@ -163,6 +163,10 @@ h1, h2 { font-weight: 650; }
     flex: 1 1 auto;
 }
 
+body.analysis-psd #waterfall-row {
+    display: none;
+}
+
 .group-label {
     width: 100%;
     font-size: 10px;

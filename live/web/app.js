@@ -32,12 +32,14 @@ let peakHold    = false;
 let showMin     = false;
 let psdYspan    = null;     // null = auto; number = fixed dB span
 let windowMs    = 20;
+let analysisMode = "spectrogram";
 
 // Current frame metadata (updated on each frame)
 let curCenter   = 1955e6;
 let curFs       = 15.36e6;
 let curNfft     = 1024;
 let curRows     = 12;
+let curBackend  = "calibrated";
 let freqsMHz    = null;     // Float32Array(nfft)
 let levels      = [-90, -10];
 
@@ -99,10 +101,11 @@ function updateMeta() {
     const winMs     = (depthRows * curNfft / curFs * 1e3).toFixed(0);
     const mode      = replaceMode ? "flicker" : "waterfall";
     const scale     = autoColor ? "auto" : "manual";
+    const analysis  = analysisMode === "ssb" ? "SSB" : (analysisMode === "psd" ? "PSD" : curBackend);
     metaEl.textContent = (
         `LIVE | center ${(curCenter / 1e6).toFixed(3)} MHz | ` +
         `span ${(curFs / 1e6).toFixed(2)} MS/s | ` +
-        `FFT ${curNfft} | ${mode} | window ${winMs} ms (${depthRows} rows) | ` +
+        `FFT ${curNfft} | ${analysis} | ${mode} | window ${winMs} ms (${depthRows} rows) | ` +
         `scale ${scale} [${levels[0].toFixed(0)}, ${levels[1].toFixed(0)}] | ` +
         `${absRF ? "absolute RF" : "baseband"} | ${renderedFps.toFixed(0)} fps`
     );
@@ -172,7 +175,7 @@ function onFrame(data) {
     const hdrText = new TextDecoder().decode(new Uint8Array(data, 4, hdrLen));
     const header  = JSON.parse(hdrText);
 
-    const { nfft, rows, channels, center, fs, gain, dtype, scale } = header;
+    const { nfft, rows, channels, center, fs, gain, dtype, scale, backend } = header;
     let offset = 4 + hdrLen;
 
     // ── Parse blocks ──────────────────────────────────────────────────────
@@ -199,6 +202,7 @@ function onFrame(data) {
     const tuningChanged = (
         nfft !== curNfft || center !== curCenter || fs !== curFs
     );
+    curBackend = backend || curBackend;
     if (tuningChanged) {
         curNfft   = nfft;
         curCenter = center;
@@ -799,6 +803,17 @@ function rowsForCurrentSettings() {
     return rowsForWindow(curFs, curNfft, windowMs);
 }
 
+function applyAnalysisMode() {
+    document.body.classList.toggle("analysis-psd", analysisMode === "psd");
+    document.body.classList.toggle("analysis-ssb", analysisMode === "ssb");
+    const backend = analysisMode === "ssb" ? "ssb" : "calibrated";
+    wfBuf[0] = wfBuf[1] = null;
+    holdBuf[0] = holdBuf[1] = null;
+    minBuf[0] = minBuf[1] = null;
+    sendControl({ backend });
+    updateMeta();
+}
+
 document.getElementById("center-btn").addEventListener("click", () => {
     const mhz = parseFloat(document.getElementById("center-mhz").value);
     if (!isNaN(mhz)) sendControl({ center: mhz * 1e6 });
@@ -852,6 +867,11 @@ document.getElementById("mode-sel").addEventListener("change", (e) => {
     wfBuf[0] = wfBuf[1] = null;
     const rows = replaceMode ? rowsForCurrentSettings() : 12;
     sendControl({ rows });
+});
+
+document.getElementById("analysis-sel").addEventListener("change", (e) => {
+    analysisMode = e.target.value;
+    applyAnalysisMode();
 });
 
 document.getElementById("win-sel").addEventListener("change", (e) => {
