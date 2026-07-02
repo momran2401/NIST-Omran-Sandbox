@@ -115,3 +115,64 @@ Phase 1 checks:
 - WebSocket receives demo frames in unmodified quicklook mode.
 - Original `/home/sensor/NIST-Omran` was not modified.
 - Known issue carried into Phase 3: the current calibrated demo backend fails due `libstdc++`/SciPy linkage before producing frames.
+
+## Phase 2 - striqt API Read-Out
+
+### 2026-07-02T13:38:00-06:00
+
+Commands run:
+
+- Local read-only: `rg` over `striqt/src/striqt` for `evaluate_spectrogram`, `json_schema`, `cellular_5g_ssb_spectrogram`, and relevant config keys.
+- Local read-only: numbered excerpts from `striqt/src/striqt/analysis/measurements/shared.py`, `_spectrogram.py`, `_cellular_5g_ssb_spectrogram.py`, `analysis/specs/structs.py`, `analysis/specs/helpers.py`, `analysis/lib/register.py`, `sensor/specs/structs.py`, `sensor/specs/helpers.py`, `sensor/bindings.py`, and `sensor/lib/bindings.py`.
+- Radio read-only: pixi Python introspection of installed module paths, installed call signatures, and `json_schema(bindings.air8201b.sweep_spec)` shape.
+- Radio read-only: grep excerpts from installed `site-packages/striqt/sensor/lib/bindings.py`, `sensor/bindings.py`, and `analysis/specs/helpers.py` where the installed binding API differs from the checked-out `striqt/` tree.
+
+Spectrogram API facts:
+
+- The lower-level calibrated spectrogram routine is `striqt.analysis.measurements.shared.evaluate_spectrogram(iq, capture, spec, *, dtype='float32', limit_digits=None, dB=True) -> tuple[array, dict]`; it directly returns the spectrogram array plus attrs. Citation: `striqt/src/striqt/analysis/measurements/shared.py:122-148`.
+- `evaluate_spectrogram` validates `sample_rate / frequency_resolution`, computes `nfft`, overlap, zero-fill, optional frequency-bin averaging, optional time-bin averaging, optional LO nulling, optional stopband trim, and ENBW/noise-bandwidth attrs. Citations: `shared.py:162-242`.
+- The current server already calls this lower-level function in `calibrated_spectrogram`, but only with `window='hann'` and `frequency_resolution=sample_rate/nfft`; it does not enable the 5G/SSB averaging parameters. Citations: `live/striqt_web_server.py:559-610`.
+- The public `spectrogram` measurement constructs `specs.Spectrogram` from kwargs and calls `shared.evaluate_spectrogram(..., dB=True, limit_digits=2, dtype='float16')`. Citation: `striqt/src/striqt/analysis/measurements/_spectrogram.py:63-84`.
+- The `as_xarray=False` knob is not an argument to `shared.evaluate_spectrogram`; it is added by the measurement registry wrapper. The wrapper accepts `as_xarray` and returns `(data, attrs)` when false. Citation: `striqt/src/striqt/analysis/lib/register.py:341-365`.
+- Dan's "use `evaluate_spectrogram` with `as_xarray=False`" is therefore slightly imprecise: use `as_xarray=False` on registered measurements, or call `shared.evaluate_spectrogram` directly without `as_xarray`.
+
+Symbol-aligned / binned spectrogram facts:
+
+- `cellular_5g_ssb_spectrogram` builds a `specs.Spectrogram` with `frequency_resolution=subcarrier_spacing/2`, `fractional_overlap=13/28`, `window_fill=15/28`, `integration_bandwidth=subcarrier_spacing`, and `trim_stopband=False`, then calls `shared.evaluate_spectrogram`. Citations: `striqt/src/striqt/analysis/measurements/_cellular_5g_ssb_spectrogram.py:99-116`.
+- It computes `symbol_count = round(28 * subcarrier_spacing / 15e3)`, masks to the first two slots of each discovery period, truncates frequency to the SSB sample rate, and reshapes into `(channels, ssb_index, symbol, frequency)`. Citations: `_cellular_5g_ssb_spectrogram.py:101-132`.
+- Frequency-bin averaging is driven by `integration_bandwidth / frequency_resolution` and performed with `sw.binned_mean(..., axis=2, fft=True)`, then scaled from mean to sum. Citations: `shared.py:180-188` and `shared.py:223-228`.
+- Time averaging is driven by `time_aperture / hop_period` for the generic spectrogram path. Citations: `shared.py:191-200` and `shared.py:229-230`.
+- Relevant schema/config keys are defined on `FrequencyAnalysisSpecBase`: `window`, `frequency_resolution`, `fractional_overlap`, `window_fill`, `integration_bandwidth`, `trim_stopband`, and `lo_bandstop`. Citation: `striqt/src/striqt/analysis/specs/structs.py:140-166`.
+- The SSB-specific schema keys include `subcarrier_spacing`, `sample_rate`, `discovery_periodicity`, `frequency_offset`, `max_block_count`, `window`, and `lo_bandstop`. Citation: `striqt/src/striqt/analysis/specs/structs.py:169-190`.
+
+Schema API facts:
+
+- The schema helper is `striqt.analysis.specs.helpers.json_schema(cls)`, which calls `msgspec.json.schema(cls, schema_hook=_schema_hook)`. Citation: `striqt/src/striqt/analysis/specs/helpers.py:230-240`; installed citation: `site-packages/striqt/analysis/specs/helpers.py:226-236`.
+- The active installed binding API differs from the checked-out source: installed `bindings.air8201b` is a `SensorBinding` with `.sweep_spec`; the radio should call `json_schema(bindings.air8201b.sweep_spec)`. Installed citations: `site-packages/striqt/sensor/lib/bindings.py:77-91`, `:113-138`, and `site-packages/striqt/sensor/bindings.py:157-164`.
+- Installed `json_schema(bindings.air8201b.sweep_spec)` returns a top-level schema with `'$ref'` and `'$defs'`; the concrete object schema is under `$defs.air8201b`.
+- `$defs.air8201b` includes `sensor_binding`, `source`, `captures`, `analysis`, `extensions`, `description`, `loops`, `adjust_captures`, `peripherals`, `sink`, `options`, and `mock_source`; `sensor_binding` is the only required top-level field in the raw schema.
+- `$defs.Air8201BSourceSpec` includes source fields such as `master_clock_rate`, `trigger_strobe`, `signal_trigger`, `array_backend`, `calibration`, `time_source`, `time_sync_at`, `clock_source`, `receive_retries`, `adc_overload_limit`, `if_overload_limit`, and `gapless`.
+- `$defs.SoapyCapture` requires `port`, `center_frequency`, and `gain`, and has defaults for `duration`, `sample_rate`, `analysis_bandwidth`, `lo_shift`, `host_resample`, `backend_sample_rate`, and `adjust_analysis`.
+- `$defs.Analysis` exposes optional measurement configs including `spectrogram`, `power_spectral_density`, `cellular_5g_pss_sync`, and `cellular_5g_ssb_spectrogram`.
+
+Phase 3 wiring plan:
+
+- Keep the current Acquirer/Computer split unchanged; only replace `calibrated_spectrogram` and frame metadata/control plumbing as needed.
+- Add an SSB/averaged spectrogram compute path using installed `striqt.analysis.measurements.cellular_5g_ssb_spectrogram(..., as_xarray=False, subcarrier_spacing=30000.0, sample_rate=7680000.0, discovery_periodicity=0.02, frequency_offset=0.0, max_block_count=None, window='blackmanharris', lo_bandstop=120000.0)`.
+- Collapse the SSB output's `(ssb_index, symbol)` axes into display rows and pad/crop to the existing `(channels, rows, nfft)` frame contract; if the SSB frequency-bin count differs from the UI `nfft`, update the frame header `nfft` to the actual width or resample only if necessary.
+- Keep `quicklook` as fallback and preserve `--quantize`.
+- Add a minimal analysis selector in the existing UI/control channel to request spectrogram, PSD-derived display, or SSB spectrogram, but make the improved calibrated/SSB path the default target for `calibrated`.
+
+Phase 4 wiring plan:
+
+- Add `GET /schema` that returns `json_schema(bindings.air8201b.sweep_spec)` from the installed pixi `striqt`.
+- Render the existing dashboard form from `$defs.air8201b`, resolving `$ref`s needed for `source`, `captures[0]`, and selected `analysis` configs.
+- Validate/clamp server-side using the schema-derived field metadata and the current conservative operational bounds.
+- Accept uploaded sweep JSON in the Appendix A shape, seed visible form fields, and preserve hidden lower-level values in client state.
+- Send dynamic capture/source updates over the existing WebSocket control path; capture settings retune live, source settings require reconnect.
+
+Phase 2 checks:
+
+- Real spectrogram and schema APIs are documented with citations.
+- Dan's `as_xarray` statement is fact-checked against code.
+- Concrete plans for Phase 3 and Phase 4 are recorded.
