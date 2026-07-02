@@ -221,3 +221,48 @@ Phase 3 checks:
 - Both RX channels are present in every decoded frame header.
 - Quantized frame serialization still works.
 - No real SDR hardware was touched.
+
+## Phase 4 - Schema-Driven Capture Settings Editor
+
+### 2026-07-02T14:28:00-06:00
+
+Commands run:
+
+- Local edits to `live/striqt_web_server.py`, `live/web/index.html`, `live/web/app.js`, and `live/web/style.css`.
+- Local syntax checks: `python -m py_compile live\striqt_web_server.py`, `node --check live\web\app.js`, and `git diff --check`.
+- Local generated-file cleanup: restored `live/__pycache__/striqt_web_server.cpython-314.pyc` after `py_compile` touched the tracked bytecode file.
+- Local commit/push: `Add schema-driven settings editor`.
+- Radio deploy: `cd /home/sensor/NIST-Omran-Sandbox && git pull --ff-only`.
+- Radio demo smoke on `127.0.0.1:8001` under pixi with temporary non-secret auth values.
+
+Changes:
+
+- Added `GET /schema`, returning `json_schema(bindings.air8201b.sweep_spec)` from the installed pixi `striqt` API. The response is sanitized so non-standard float values such as schema `Infinity` become valid JSON.
+- Added a schema-rendered settings panel to the existing dashboard. It renders capture and source fields from schema properties, uses enum selects, boolean checkboxes, numeric inputs with schema min/max metadata, and supports JSON upload seeding.
+- Added WebSocket handling for nested `capture` and `source` updates. Capture fields map into live config and are clamped server-side; source fields are logged as reconnect-required and are not live-applied.
+- Skipped source params `receive_retries`, `adc_overload_limit`, `if_overload_limit`, and `gapless` in the generated source editor.
+- Added one-viewer enforcement: a second WebSocket is refused before it can send controls.
+
+Demo verification:
+
+- Auth gate:
+  - `/` without credentials: `401`
+  - `/` with temporary test credentials: `200`
+  - `/schema` without credentials: `401`
+- `/schema` with credentials returned valid JSON with top-level keys `["$defs", "$ref"]`, `30` defs, and expected defs `air8201b`, `SoapyCapture`, and `Air8201BSourceSpec`.
+- WebSocket first frame before settings: center `1955000000.0`, sample rate `15360000.0`, gain `0.0`, channels `[0,1]`.
+- Capture settings update sent over WebSocket:
+  - payload: `center_frequency=1960000000.0`, `sample_rate=7680000.0`, `gain=-5.0`, `duration=0.02`
+  - subsequent frame reflected center `1960000000.0`, sample rate `7680000.0`, gain `-5.0`, rows clamped to `300`, channels `[0,1]`.
+- Second WebSocket connection was refused; client observed `InvalidStatus`.
+- Source settings payload including `clock_source=external` and skipped `receive_retries=3` did not disrupt streaming; next frame still had channels `[0,1]`.
+- Port `8001` was free after the test.
+
+Phase 4 checks:
+
+- `/schema` returns valid auth-gated JSON.
+- The existing UI contains a schema-rendered settings panel and JSON upload path.
+- Capture setting changes retune the demo stream through the existing WebSocket control channel.
+- Source settings are gated as reconnect-required and skipped low-level source params are not rendered.
+- A second WebSocket is refused.
+- No real SDR hardware was touched.
