@@ -1,2 +1,39 @@
-CLAUDE.md
-CLAUDE.md
+# Local environments and caches
+.pixi/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Large capture/data outputs
+*.zarr/
+*.zarr
+data/
+datasets/
+captures/
+capture/
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# Secrets and local credentials
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*token*
+*secret*
+*credential*
+cert.pem
+credentials.json
+*.credentials.json
+
+# Cloudflare tunnel material must stay off git
+.cloudflared/
+config.yml
+
+# striqt is provided by the radio pixi environment and must not be added again.
+striqt/

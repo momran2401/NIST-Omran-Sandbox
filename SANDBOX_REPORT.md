@@ -66,3 +66,22 @@ sudo systemctl daemon-reload
 If Cloudflare public exposure is changed later, restore `/etc/cloudflared/config.yml` from the backup created in Phase 5b, then validate and reload cloudflared.
 
 The original `/home/sensor/NIST-Omran` project and original `radio-web.service` / `cloudflared.service` are treated as read-only except for the explicit Phase 4.5 live-service validation window.
+
+## Phase 1 - Sandbox and Git Flow
+
+### 2026-07-02T13:05:00-06:00
+
+Commands run:
+
+- Local: `git push origin main` to publish the Phase 0 report.
+- Local/radio read-only source stream: `ssh sensor@24.128.57.203 "tar -czf - -C /home/sensor/NIST-Omran ..."` piped to local `tar -xzf - -C C:/Users/mao8/NIST-Omran-Sandbox`.
+- Local: `git status --short`, `git diff --stat`, `git diff --name-only`, `git diff --numstat`, `git diff --check`, `git status --porcelain=v2`.
+- Local: `rg` secret scan excluding `striqt/**`, `SANDBOX_REPORT.md`, `*.pyc`, and `.git/**`.
+- Local: updated `.gitignore` to ignore pixi envs, caches, capture/data outputs, env/credential material, Cloudflare tunnel material, and future `striqt/` additions.
+
+Findings and decisions:
+
+- The sandbox repository already had a history and a `main` branch, so it was cloned rather than reinitialized.
+- The radio-to-local seed produced no non-`striqt` content differences beyond `.gitignore`; timestamp/line-ending noise was restored before commit.
+- The secret scan found only source/documentation references and one example dev credential string already documented as non-deployed. No private keys, token assignments, Cloudflare credentials, or env files were found in the non-`striqt` tree.
+- The existing tracked `striqt/` tree remains untouched due to the hard guardrail.
