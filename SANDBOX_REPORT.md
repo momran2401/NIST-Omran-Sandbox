@@ -85,3 +85,33 @@ Findings and decisions:
 - The radio-to-local seed produced no non-`striqt` content differences beyond `.gitignore`; timestamp/line-ending noise was restored before commit.
 - The secret scan found only source/documentation references and one example dev credential string already documented as non-deployed. No private keys, token assignments, Cloudflare credentials, or env files were found in the non-`striqt` tree.
 - The existing tracked `striqt/` tree remains untouched due to the hard guardrail.
+
+### 2026-07-02T13:16:00-06:00
+
+Commands run:
+
+- Radio write inside sandbox: `git clone https://github.com/momran2401/NIST-Omran-Sandbox /home/sensor/NIST-Omran-Sandbox`.
+- Radio: started the unmodified sandbox web server under pixi in `--demo` mode on `127.0.0.1:8001` with temporary non-secret auth values.
+- Radio: `curl` checks against `http://127.0.0.1:8001/`.
+- Radio: short pixi Python WebSocket client using a Basic Auth header, decoding the binary frame header.
+- Radio: `ss -ltnp` check confirmed port `8001` was released after baseline.
+
+Baseline results:
+
+- Runtime clone exists at `/home/sensor/NIST-Omran-Sandbox`, commit `18c7a8f`.
+- Default `--demo` / calibrated backend starts and serves HTTP, but emits no frames because SciPy fails to load against the system `libstdc++`: missing `GLIBCXX_3.4.29`.
+- The unmodified server's built-in `--backend quicklook` mode passed the Phase 1 stream baseline on port `8001`:
+  - `server_ready=1`
+  - no-auth HTTP: `401`
+  - auth HTTP with temporary test creds: `200`
+  - WebSocket frames in about 5 seconds: `41`
+  - first frame header: `demo=true`, `channels=[0,1]`, `shape=[12,1024]`, `nfft=1024`, `rows=12`, `fs=15360000.0`
+- Port `8001` was free after the baseline process stopped.
+
+Phase 1 checks:
+
+- Sandbox server starts on `8001` under the pixi environment.
+- Auth gate works with env-provided credentials.
+- WebSocket receives demo frames in unmodified quicklook mode.
+- Original `/home/sensor/NIST-Omran` was not modified.
+- Known issue carried into Phase 3: the current calibrated demo backend fails due `libstdc++`/SciPy linkage before producing frames.
