@@ -109,6 +109,7 @@ except Exception as e:
 # FastAPI
 try:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi.responses import JSONResponse
     from fastapi.staticfiles import StaticFiles
 except ImportError:
     print(
@@ -414,6 +415,34 @@ class SharedConfig:
 
     def update(self, update: dict) -> bool:
         """Apply key/value updates. Returns True if anything changed."""
+        if "capture" in update and isinstance(update["capture"], dict):
+            capture = update["capture"]
+            mapped = {}
+            if capture.get("center_frequency") is not None:
+                mapped["center"] = capture["center_frequency"]
+            if capture.get("sample_rate") is not None:
+                mapped["sample_rate"] = capture["sample_rate"]
+            if capture.get("gain") is not None:
+                mapped["gain"] = capture["gain"]
+            if capture.get("duration") is not None:
+                try:
+                    with self._lock:
+                        nfft = self._cfg.nfft
+                        sample_rate = self._cfg.sample_rate
+                    rows = round(float(capture["duration"]) * sample_rate / max(nfft, 1))
+                    mapped["rows"] = max(1, min(rows, MAX_LIVE_ROWS))
+                except Exception:
+                    pass
+            update = dict(update)
+            update.update(mapped)
+
+        if "source" in update and isinstance(update["source"], dict):
+            allowed = sorted(k for k in update["source"] if k not in {
+                "receive_retries", "adc_overload_limit", "if_overload_limit", "gapless",
+            })
+            if allowed:
+                print(f"[config] source changes require reconnect: {allowed}")
+
         valid = {"center", "sample_rate", "gain", "nfft", "rows", "backend"}
         changes = []
         with self._lock:
@@ -429,6 +458,14 @@ class SharedConfig:
                 # Clamp rows so a misbehaving browser can't overload the radio
                 if key == "rows":
                     value = int(max(1, min(value, MAX_LIVE_ROWS)))
+                elif key == "center":
+                    value = float(max(300e6, min(value, 6e9)))
+                elif key == "sample_rate":
+                    value = float(max(1e6, min(value, 125e6)))
+                elif key == "gain":
+                    value = float(max(-60.0, min(value, 10.0)))
+                elif key == "nfft":
+                    value = int(max(128, min(value, 8192)))
                 old = getattr(self._cfg, key)
                 if old == value:
                     continue
@@ -1216,6 +1253,35 @@ app.add_middleware(BasicAuthMiddleware)
 app.add_middleware(NoCacheMiddleware)
 
 
+def _json_safe(obj):
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
+
+
+def capture_editor_schema():
+    from striqt.sensor import bindings
+    from striqt.analysis.specs.helpers import json_schema
+
+    binding = bindings.air8201b
+    sweep_cls = getattr(binding, "sweep_spec", None)
+    if sweep_cls is None:
+        sensor = getattr(binding, "sensor", None)
+        sweep_cls = getattr(sensor, "sweep_spec_cls", None)
+    if sweep_cls is None:
+        raise RuntimeError("Unable to locate air8201b sweep schema")
+    return _json_safe(json_schema(sweep_cls))
+
+
+@app.get("/schema")
+async def schema_endpoint():
+    return JSONResponse(capture_editor_schema())
+
+
 async def _broadcaster():
     """
     Polls acquirer.latest() at BROADCAST_FPS, serializes the frame once, and
@@ -1286,6 +1352,11 @@ async def ws_endpoint(ws: WebSocket):
         {"center": Hz, "sample_rate": Hz, "gain": dB, "nfft": int, "rows": int}
     Sends spectrogram frames as binary (see serialize_frame).
     """
+    if _connections:
+        await ws.close(code=1008)
+        print(f"[ws] refused extra client: {ws.client}")
+        return
+
     await ws.accept()
     _connections.add(ws)
     client = ws.client

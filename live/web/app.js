@@ -146,6 +146,13 @@ function connect() {
     };
 
     ws.onmessage = (e) => {
+        if (typeof e.data === "string") {
+            try {
+                const msg = JSON.parse(e.data);
+                if (msg.message) logMsg(msg.message);
+            } catch (_) {}
+            return;
+        }
         if (!paused) onFrame(e.data);
     };
 
@@ -936,6 +943,161 @@ document.getElementById("yspan-sel").addEventListener("change", (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Schema-driven settings editor
+// ---------------------------------------------------------------------------
+
+const SOURCE_SKIP = new Set(["receive_retries", "adc_overload_limit", "if_overload_limit", "gapless"]);
+const captureFields = [
+    "center_frequency", "sample_rate", "gain", "duration", "analysis_bandwidth",
+    "port", "lo_shift", "host_resample", "backend_sample_rate",
+];
+const sourceFields = [
+    "master_clock_rate", "trigger_strobe", "signal_trigger", "array_backend",
+    "calibration", "time_source", "time_sync_at", "clock_source",
+];
+let schemaDoc = null;
+let hiddenSweepSettings = {};
+
+function schemaDefs() {
+    return schemaDoc && (schemaDoc.$defs || schemaDoc.definitions) || {};
+}
+
+function resolveSchema(schema) {
+    if (!schema || !schema.$ref) return schema || {};
+    const name = schema.$ref.split("/").pop();
+    return schemaDefs()[name] || schema;
+}
+
+function scalarSchema(schema) {
+    schema = resolveSchema(schema);
+    if (schema.anyOf) {
+        return resolveSchema(schema.anyOf.find((item) => item.type !== "null") || schema.anyOf[0]);
+    }
+    return schema;
+}
+
+function defaultFor(schema, fallback = "") {
+    if (!schema) return fallback;
+    if (Object.prototype.hasOwnProperty.call(schema, "default")) return schema.default;
+    return fallback;
+}
+
+function makeField(group, name, schema, value) {
+    const spec = scalarSchema(schema);
+    const label = document.createElement("label");
+    label.textContent = name.replaceAll("_", " ");
+
+    let input;
+    if (spec.enum) {
+        input = document.createElement("select");
+        for (const opt of spec.enum) {
+            const option = document.createElement("option");
+            option.value = opt;
+            option.textContent = String(opt);
+            input.appendChild(option);
+        }
+    } else if (spec.type === "boolean") {
+        input = document.createElement("input");
+        input.type = "checkbox";
+    } else {
+        input = document.createElement("input");
+        input.type = spec.type === "integer" || spec.type === "number" ? "number" : "text";
+        if (spec.type === "integer") input.step = "1";
+        if (spec.type === "number") input.step = "any";
+        if (typeof spec.minimum === "number") input.min = spec.minimum;
+        if (typeof spec.maximum === "number") input.max = spec.maximum;
+        if (typeof spec.exclusiveMinimum === "number") input.min = spec.exclusiveMinimum;
+    }
+
+    input.dataset.group = group;
+    input.dataset.field = name;
+    input.dataset.type = spec.type || "";
+    setFieldValue(input, value ?? defaultFor(spec));
+    label.appendChild(input);
+    return label;
+}
+
+function setFieldValue(input, value) {
+    if (value === null || value === undefined) value = "";
+    if (Array.isArray(value)) value = value.join(",");
+    if (input.type === "checkbox") {
+        input.checked = Boolean(value);
+    } else {
+        input.value = String(value);
+    }
+}
+
+function readFieldValue(input) {
+    if (input.type === "checkbox") return input.checked;
+    const raw = input.value.trim();
+    if (raw === "") return null;
+    if (input.dataset.type === "integer") return parseInt(raw, 10);
+    if (input.dataset.type === "number") return parseFloat(raw);
+    if (raw.includes(",") && input.dataset.field === "port") {
+        return raw.split(",").map((item) => parseInt(item.trim(), 10)).filter((item) => !Number.isNaN(item));
+    }
+    return raw;
+}
+
+function renderSettings(schema, seed = {}) {
+    schemaDoc = schema;
+    hiddenSweepSettings = seed;
+    const defs = schemaDefs();
+    const sweep = defs.air8201b || resolveSchema(schema);
+    const source = resolveSchema(sweep.properties.source);
+    const capture = resolveSchema((sweep.properties.captures || {}).items);
+    const sourceValues = seed.source || {};
+    const captureValues = (seed.captures && seed.captures[0]) || {};
+
+    const captureForm = document.getElementById("capture-settings-form");
+    const sourceForm = document.getElementById("source-settings-form");
+    captureForm.textContent = "";
+    sourceForm.textContent = "";
+
+    for (const name of captureFields) {
+        if (capture.properties && capture.properties[name]) {
+            captureForm.appendChild(makeField("capture", name, capture.properties[name], captureValues[name]));
+        }
+    }
+    for (const name of sourceFields) {
+        if (!SOURCE_SKIP.has(name) && source.properties && source.properties[name]) {
+            sourceForm.appendChild(makeField("source", name, source.properties[name], sourceValues[name]));
+        }
+    }
+}
+
+function collectSettings() {
+    const payload = { capture: {}, source: {} };
+    document.querySelectorAll("#settings-editor input, #settings-editor select").forEach((input) => {
+        payload[input.dataset.group][input.dataset.field] = readFieldValue(input);
+    });
+    return payload;
+}
+
+async function loadSchema(seed = {}) {
+    const resp = await fetch("/schema", { cache: "no-store" });
+    if (!resp.ok) throw new Error(`schema HTTP ${resp.status}`);
+    renderSettings(await resp.json(), seed);
+}
+
+document.getElementById("settings-apply").addEventListener("click", () => {
+    sendControl(collectSettings());
+    logMsg("Settings sent");
+});
+
+document.getElementById("settings-upload").addEventListener("change", async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    try {
+        const seed = JSON.parse(await file.text());
+        await loadSchema(seed);
+        logMsg("Settings JSON loaded");
+    } catch (err) {
+        logMsg(`Settings JSON failed: ${err.message}`, "ERROR");
+    }
+});
+
+// ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
 
@@ -948,4 +1110,5 @@ freqsMHz = buildFreqsMHz(curCenter, curFs, curNfft, absRF);
 initUplot(freqsMHz);
 
 connect();
+loadSchema().catch((err) => logMsg(`Schema load failed: ${err.message}`, "ERROR"));
 logMsg("App initialised. Connecting to server…");
