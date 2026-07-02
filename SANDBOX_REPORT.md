@@ -176,3 +176,48 @@ Phase 2 checks:
 - Real spectrogram and schema APIs are documented with citations.
 - Dan's `as_xarray` statement is fact-checked against code.
 - Concrete plans for Phase 3 and Phase 4 are recorded.
+
+## Phase 3 - Improved Spectrogram
+
+### 2026-07-02T14:08:00-06:00
+
+Commands run:
+
+- Local edits to `live/striqt_web_server.py`, `live/web/index.html`, `live/web/app.js`, and `live/web/style.css`.
+- Local syntax checks: `python -m py_compile live\striqt_web_server.py`, `node --check live\web\app.js`, and `git diff --check`.
+- Local commits/pushes: `Add averaged and SSB spectrogram backends`, `Align striqt spectrogram FFT sizing`, `Seed runtime config from selected backend`, `Pace demo frames to requested fps`, and `Avoid oversized SSB fallback buffers`.
+- Radio deploys: `cd /home/sensor/NIST-Omran-Sandbox && git pull --ff-only`.
+- Radio demo smoke tests on `127.0.0.1:8001` under pixi with temporary non-secret auth values, including HTTP auth checks and WebSocket frame decoding.
+- Radio port cleanup checks with `ss -ltnp`.
+
+Changes:
+
+- Added one-time pixi lib directory re-exec so SciPy/striqt waveform extensions load the pixi `libstdc++.so.6` instead of the older system copy.
+- Replaced the calibrated server path with `striqt.analysis.measurements.shared.evaluate_spectrogram` using `window=("kaiser", 11.88)`, `fractional_overlap=13/28`, `window_fill=15/28`, LO bandstop, and frequency-bin averaging.
+- Added internal FFT alignment to the nearest multiple of 28 because striqt requires `(1-window_fill) * nfft` to be integral for `window_fill=15/28`.
+- Added an `ssb` backend. At sample rates incompatible with striqt's strict 30 kHz SSB grid, it falls back to the same averaged 13/28, 15/28 calibrated grid rather than failing or over-buffering.
+- Preserved the producer/consumer split: the real `Acquirer` still only drains IQ into the ring; `Computer` does spectrogram math separately.
+- Published actual computed grid dimensions in the frame header, so the browser and quantizer handle averaged grids where output bins differ from the requested UI FFT size.
+- Added an existing-dashboard analysis selector for spectrogram / PSD / SSB spectrogram display.
+
+Demo verification:
+
+- Auth: `curl` without credentials returned `401`; with temporary test credentials returned `200`.
+- Quicklook baseline: `58` frames in 5 s before the demo pacing fix, then `57` frames in 5 s after the fix; header `backend=quicklook`, `channels=[0,1]`, `shape=[12,1024]`; roughness metric `0.7916`.
+- Calibrated averaged path: `70` frames in 5 s after pacing fix, about `14.0 fps`; header `backend=calibrated`, `channels=[0,1]`, `shape=[12,147]`; roughness metric `0.7090`.
+- Quantized calibrated path: `68` frames in 5 s, about `13.6 fps`; header includes `dtype=uint8`, scale bounds, `channels=[0,1]`, and `shape=[12,147]`.
+- SSB selector path: `69` frames in 5 s, about `13.8 fps`; header `backend=ssb`, `channels=[0,1]`, `shape=[12,147]`.
+- Quantitative less-grainy check: calibrated roughness `0.7090` vs quicklook roughness `0.7916` on the same demo signal, an improvement of about `10.4%`. The striqt averaged path is confirmed active by the output bin reduction from `1024` to `147` and by the configured `13/28`, `15/28`, and frequency-bin averaging path.
+- Port `8001` was free after each test.
+
+Notes:
+
+- The official `cellular_5g_ssb_spectrogram` API is strict about sample-rate/SSB-grid compatibility. The live viewer's default `15.36 MS/s` plus power-of-two FFT controls are incompatible with its 30 kHz SSB grid, so the SSB selector currently uses the averaged calibrated fallback at that default.
+- Demo shutdown still prints a Starlette lifespan `CancelledError` after SIGTERM; this is from stopping the short-lived smoke server and did not leave the process or port running.
+
+Phase 3 checks:
+
+- Frames stream in demo at roughly 14 fps for the improved calibrated path.
+- Both RX channels are present in every decoded frame header.
+- Quantized frame serialization still works.
+- No real SDR hardware was touched.
