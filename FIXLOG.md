@@ -118,3 +118,17 @@ not exercisable on port 8001. Ask if you want it applied.
 
 **Verify [demo]:** band monitor "RX1 x.x dB" over a dragged band equals the average of the
 fixed mean trace over the same band within ~0.5 dB (previously the mean trace read lower).
+
+### LV-F4 — Truthful labels: FFT vs bins, hop-aware window, units on PSD/CSV/PNG
+**File:** `live/web/app.js` (no `index.html` change needed — the y-axis label is JS-driven)
+**Changed:** Added client state `curFftNfft`/`curBinAvg` (from the LV-F1 header fields).
+(1) `updateMeta` prints FFT as `${radioNfft}→${curFftNfft} (${curBins} bins × ${curBinAvg})` for
+calibrated/ssb and plain `${radioNfft}` for quicklook; the window ms is already the LV-W1
+hop-aware value. (2) New `psdYLabel()` sets the uPlot y-axis to "Integrated power (dB rel. FS)"
+for calibrated/ssb vs "Power (dB rel. FS / bin)" for quicklook (re-applied when `initUplot`
+rebuilds on backend/tuning change). (3) `savePsdCsv` prepends `# backend=`, `# fft_nfft=`,
+`# bin_avg=`, `# units=dB (uncalibrated, band-integrated|per-bin)` comment lines. (4) `exportPng`
+caption uses the real FFT size and the true hop-aware window ms.
+
+**Verify [demo]:** switch backends in `--demo` and confirm the label changes and the ~8.5 dB
+level shift is now explained on-screen; export CSV and check the header comment lines.

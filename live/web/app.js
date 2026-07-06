@@ -44,6 +44,8 @@ let curBackend  = "calibrated";
 let freqsMHz    = null;     // Float32Array(nfft)
 let curF0       = null;     // header freqs_hz_f0 (true axis origin, Hz baseband)
 let curStep     = null;     // header freqs_hz_step (true bin spacing, Hz)
+let curFftNfft  = 1024;     // header fft_nfft (real FFT size behind the bin count)
+let curBinAvg   = 1;        // header bin_avg (frequency-bin averaging factor)
 let lastBackendWarn = null; // dedups the "SSB unavailable" status warning
 let levels      = [-90, -10];
 
@@ -106,10 +108,15 @@ function updateMeta() {
     const mode      = replaceMode ? "flicker" : "waterfall";
     const scale     = autoColor ? "auto" : "manual";
     const analysis  = curBackend;   // executed backend from the header (honest — LV-F2)
+    // FFT label discloses radio size → real FFT size (bins × averaging) for the
+    // calibrated/ssb averaged grid; plain radio size for the per-bin quicklook.
+    const fftLabel  = curBackend === "quicklook"
+        ? `${radioNfft}`
+        : `${radioNfft}→${curFftNfft} (${curBins} bins × ${curBinAvg})`;
     metaEl.textContent = (
         `LIVE | center ${(curCenter / 1e6).toFixed(3)} MHz | ` +
         `span ${(curFs / 1e6).toFixed(2)} MS/s | ` +
-        `FFT ${curBins} | ${analysis} | ${mode} | window ${winMs} ms (${depthRows} rows) | ` +
+        `FFT ${fftLabel} | ${analysis} | ${mode} | window ${winMs} ms (${depthRows} rows) | ` +
         `scale ${scale} [${levels[0].toFixed(0)}, ${levels[1].toFixed(0)}] | ` +
         `${absRF ? "absolute RF" : "baseband"} | ${renderedFps.toFixed(0)} fps`
     );
@@ -223,7 +230,7 @@ function onFrame(data) {
     const header  = JSON.parse(hdrText);
 
     const { nfft, rows, channels, center, fs, gain, dtype, scale, backend,
-            backend_requested, freqs_hz_f0, freqs_hz_step } = header;
+            backend_requested, freqs_hz_f0, freqs_hz_step, fft_nfft, bin_avg } = header;
     let offset = 4 + hdrLen;
 
     // ── Parse blocks ──────────────────────────────────────────────────────
@@ -253,6 +260,8 @@ function onFrame(data) {
         nfft !== curBins || center !== curCenter || fs !== curFs || stepVal !== curStep
     );
     curBackend = backend || curBackend;
+    curFftNfft = (fft_nfft !== undefined && fft_nfft !== null) ? fft_nfft : nfft;
+    curBinAvg  = (bin_avg  !== undefined && bin_avg  !== null) ? bin_avg  : 1;
 
     // Honest backend reporting: warn once when the server had to substitute a
     // backend (e.g. SSB is unavailable at this sample rate) — LV-F2.
@@ -397,6 +406,14 @@ const COL = {
     diff:    "#e6e9ef",
 };
 
+// PSD y-axis label depends on the backend: calibrated/ssb values are band-
+// integrated over one averaged bin (~+8.5 dB vs per-bin); quicklook is per-bin.
+function psdYLabel() {
+    return curBackend === "quicklook"
+        ? "Power (dB rel. FS / bin)"
+        : "Integrated power (dB rel. FS)";
+}
+
 function initUplot(freqs) {
     const container = document.getElementById("psd-plot");
     container.innerHTML = "";  // clear previous instance
@@ -425,7 +442,7 @@ function initUplot(freqs) {
                 font:   "11px Menlo,monospace",
             },
             {
-                label:  "Power (dB)",
+                label:  psdYLabel(),
                 stroke: PSD_FG, ticks: { stroke: PSD_FG }, grid: { stroke: "#243042" },
                 font:   "11px Menlo,monospace",
             },
@@ -808,7 +825,13 @@ function savePsdCsv() {
         return;
     }
     const nfft = freqsMHz.length;
-    const rows = ["freq_mhz,rx1_mean_db,rx1_max_db,rx2_mean_db,rx2_max_db"];
+    const rows = [
+        `# backend=${curBackend}`,
+        `# fft_nfft=${curFftNfft}`,
+        `# bin_avg=${curBinAvg}`,
+        `# units=dB (uncalibrated, ${curBackend === "quicklook" ? "per-bin" : "band-integrated"})`,
+        "freq_mhz,rx1_mean_db,rx1_max_db,rx2_mean_db,rx2_max_db",
+    ];
     for (let i = 0; i < nfft; i++) {
         const m0 = psdData.mean[0] ? psdData.mean[0][i].toFixed(3) : "";
         const x0 = psdData.max[0]  ? psdData.max[0][i].toFixed(3)  : "";
@@ -843,7 +866,10 @@ function exportPng() {
 
     // Settings caption
     const ts  = new Date().toLocaleString();
-    const cap = `${ts}  center ${(curCenter / 1e6).toFixed(3)} MHz  span ${(curFs / 1e6).toFixed(2)} MS/s  FFT ${curBins}`;
+    const capDepth = wfBuf[0] ? wfBuf[0].length / curBins : curRows;
+    const capWinMs = (capDepth * radioNfft * backendHopFrac() / curFs * 1e3).toFixed(0);
+    const capFft   = curBackend === "quicklook" ? `${radioNfft}` : `${radioNfft}→${curFftNfft}`;
+    const cap = `${ts}  center ${(curCenter / 1e6).toFixed(3)} MHz  span ${(curFs / 1e6).toFixed(2)} MS/s  FFT ${capFft}  window ${capWinMs} ms`;
     ctx.fillStyle = "#d0d0d0";
     ctx.font      = "11px Menlo,monospace";
     ctx.fillText(cap, 10, H - 8);
