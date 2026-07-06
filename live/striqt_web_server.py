@@ -1310,10 +1310,14 @@ def serialize_frame(header: dict, blocks: list, quantize: bool = False) -> bytes
     dequantized blocks, which differ from float32 by at most 1/255 of the dB range.
     """
     if quantize and blocks:
-        # Use per-frame global range so quantization is consistent across channels
+        # Use per-frame global range so quantization is consistent across channels.
+        # NaN-safe: a single NaN would make np.percentile return NaN and turn the
+        # whole uint8 frame to garbage (LV-R4).
         all_vals = np.concatenate([b.ravel() for b in blocks])
-        vmin = float(np.percentile(all_vals, 1))
-        vmax = float(np.percentile(all_vals, 99))
+        vmin = float(np.nanpercentile(all_vals, 1))
+        vmax = float(np.nanpercentile(all_vals, 99))
+        if not (np.isfinite(vmin) and np.isfinite(vmax)):
+            vmin, vmax = -100.0, 0.0   # all-NaN block fallback
         if vmax - vmin < 1.0:
             vmax = vmin + 1.0
         hdr       = dict(header, dtype="uint8", scale=[vmin, vmax])
@@ -1321,7 +1325,7 @@ def serialize_frame(header: dict, blocks: list, quantize: bool = False) -> bytes
         parts     = [struct.pack("<I", len(hdr_bytes)), hdr_bytes]
         rng       = vmax - vmin
         for block in blocks:
-            u8 = ((np.asarray(block, dtype=np.float32) - vmin) / rng * 255
+            u8 = ((np.nan_to_num(np.asarray(block, dtype=np.float32), nan=vmin) - vmin) / rng * 255
                   ).clip(0, 255).astype(np.uint8)
             parts.append(u8.tobytes(order="C"))
     else:

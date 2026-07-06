@@ -239,3 +239,16 @@ socket is never added to `_connections`, so the broadcaster never sends to it.
 **Verify [demo]:** two browser tabs — the second shows the busy state and takes over within ~2 s of
 closing the first; kill the holder's network (devtools offline) and the slot frees within ~30 s;
 a wrong-password reload shows the auth state instead of silent retry.
+
+### LV-R4 — NaN-safe quantizer
+**File:** `live/striqt_web_server.py`
+**Changed:** `serialize_frame`'s quantize path used `np.percentile` and plain subtraction — a single
+NaN made `vmin`/`vmax` NaN and turned the whole uint8 frame to garbage. Switched to
+`np.nanpercentile` (with an all-NaN `-100..0` fallback) and `np.nan_to_num(block, nan=vmin)` before
+scaling. Complements LV-F8's upstream scrub (which keeps calibrated/ssb NaN-free) as
+defense-in-depth for any future NaN-producing config. Simulated: NaN pixel maps to the vmin bucket,
+frame renders; all-NaN block hits the fallback.
+
+**Verify [demo]:** temporarily set `blocks[0][0,0]=np.nan` in `compute_blocks` and run
+`--demo --quantize` → the waterfall still renders normally (previously all-noise); remove the
+injection.
