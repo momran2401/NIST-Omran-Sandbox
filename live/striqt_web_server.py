@@ -427,13 +427,39 @@ class NoCacheMiddleware:
 # decided by tier 1 (knowable rules → snap and tell) and tier 2 (striqt itself,
 # via scratch_validate_analysis) in SharedConfig._validate_analysis.
 
+# Freedom-model analysis targets (P2b-1). Each target names one striqt analysis
+# whose parameter block is editable from the DAN-mode Analysis panel; the same
+# three tiers (snap & tell / scratch-validate / compute backstop) govern all of
+# them. A control message routes with {"analysis": {"target": <name>, ...}};
+# no target means "spectrogram" (the P2a wire format, unchanged).
+#   fields:  message field name -> RadioConfig attribute
+#   virtual: message fields validated here that map onto a non-analysis cfg key
+#            (frequency_resolution is the second view of nfft)
+#   order:   tier-2 one-at-a-time application order (RadioConfig keys)
+ANALYSIS_TARGETS = {
+    "spectrogram": {
+        "fields": {
+            "window":                "window",
+            "fractional_overlap":    "fractional_overlap",
+            "window_fill":           "window_fill",
+            "integration_bandwidth": "integration_bandwidth",
+            "lo_bandstop":           "lo_bandstop",
+            "trim_stopband":         "trim_stopband",
+        },
+        "virtual": ("frequency_resolution",),
+        "order": ("nfft", "window", "fractional_overlap", "window_fill",
+                  "integration_bandwidth", "lo_bandstop", "trim_stopband"),
+    },
+}
+
 # RadioConfig fields that are only settable through the validated "analysis"
-# block. Stripped from the top level of every control message so no client can
-# bypass the freedom model.
-ANALYSIS_CFG_KEYS = frozenset({
-    "window", "fractional_overlap", "window_fill",
-    "integration_bandwidth", "lo_bandstop", "trim_stopband",
-})
+# block (the union across targets). Stripped from the top level of every
+# control message so no client can bypass the freedom model.
+ANALYSIS_CFG_KEYS = frozenset(
+    cfg_key
+    for target in ANALYSIS_TARGETS.values()
+    for cfg_key in target["fields"].values()
+)
 
 # Hard-default analysis values — the final revert target for the P2a-3 backstop
 # (identical to the RadioConfig field defaults).
@@ -503,7 +529,7 @@ def _parse_optional_hz(value, *, auto_ok: bool = False):
     return value
 
 
-def scratch_validate_analysis(cfg: "RadioConfig"):
+def scratch_validate_spectrogram(cfg: "RadioConfig"):
     """
     Tier 2 of the freedom model: judge a proposed analysis config the only way
     that is always right — by asking striqt. Builds the exact Spectrogram spec
@@ -534,6 +560,19 @@ def scratch_validate_analysis(cfg: "RadioConfig"):
     except Exception as e:
         return str(e).strip() or type(e).__name__
     return None
+
+
+# Tier-2 scratch validators, one per analysis target (P2b-1). Each judges a
+# proposed RadioConfig by running the target's real striqt pipeline on a tiny
+# synthetic buffer — never the live ring.
+SCRATCH_VALIDATORS = {
+    "spectrogram": scratch_validate_spectrogram,
+}
+
+
+def scratch_validate_analysis(cfg: "RadioConfig", target: str = "spectrogram"):
+    fn = SCRATCH_VALIDATORS.get(target)
+    return fn(cfg) if fn else None
 
 
 # ---------------------------------------------------------------------------
@@ -668,7 +707,7 @@ class SharedConfig:
         )
         return changed
 
-    def probe_analysis(self, trial_cfg: "RadioConfig"):
+    def probe_analysis(self, trial_cfg: "RadioConfig", target: str = "spectrogram"):
         """
         Tier-2 scratch validation, executed on the compute thread. striqt's
         get_window carries a persistent on-disk cache whose handle is bound to
@@ -684,13 +723,13 @@ class SharedConfig:
             self._probe_seq += 1
             seq = self._probe_seq
             self._probe_done.clear()
-            self._probe_req = (seq, trial_cfg)
+            self._probe_req = (seq, trial_cfg, target)
             if self._probe_done.wait(2.0):
                 res = self._probe_res
                 if res and res[0] == seq:
                     return res[1]
             self._probe_req = None
-            return scratch_validate_analysis(trial_cfg)
+            return scratch_validate_analysis(trial_cfg, target)
 
     def service_probe(self):
         """Called by the compute thread every loop: run a pending tier-2 probe."""
@@ -698,8 +737,8 @@ class SharedConfig:
         if job is None:
             return
         self._probe_req = None
-        seq, trial_cfg = job
-        self._probe_res = (seq, scratch_validate_analysis(trial_cfg))
+        seq, trial_cfg, target = job
+        self._probe_res = (seq, scratch_validate_analysis(trial_cfg, target))
         self._probe_done.set()
 
     def push_notice(self, message: str):
@@ -712,28 +751,12 @@ class SharedConfig:
             notices, self._notices = self._notices, []
             return notices
 
-    def _validate_analysis(self, update: dict):
+    def _effective_radio(self, update: dict):
         """
-        Freedom-model gate (P2a-2) for the "analysis" block of a control message.
-        Never mutates the live config — returns (accepted, rounded, rejected,
-        ignored) where `accepted` maps RadioConfig keys to values that passed
-        tier 1 (knowable rules → snap and tell) AND tier 2 (striqt scratch
-        validation on a tiny buffer). `rounded`/`rejected` are the ack entries:
-        [{field, requested, used, reason}] / [{field, requested, reason}].
+        Effective radio params for THIS message (LV-R9b): validation must see
+        the nfft/sample_rate/backend the message itself is applying (already
+        mapped to the top level by the capture branch), not the stale cfg.
         """
-        req = update.get("analysis") or {}
-        rounded, rejected, ignored = [], [], []
-        accepted = {}          # cfg key -> validated value
-        ack_field = {}         # cfg key -> field name reported in the ack
-
-        def tell(field, requested, used, reason):
-            rounded.append({
-                "field": field, "requested": requested, "used": used, "reason": reason,
-            })
-
-        # Effective radio params for THIS message (LV-R9b): validation must see
-        # the nfft/sample_rate/backend the message itself is applying (already
-        # mapped to the top level by the capture branch), not the stale cfg.
         eff = self.snapshot()
         try:
             if update.get("sample_rate") is not None:
@@ -748,7 +771,32 @@ class SharedConfig:
                     eff.backend = backend
         except (TypeError, ValueError):
             pass
-        on_calibrated_grid = eff.backend in {"calibrated", "ssb"}
+        return eff
+
+    def _tier1_freq_fields(self, req, eff, *, cfg_prefix, ack_prefix,
+                           on_calibrated_grid, rounded, rejected):
+        """
+        Tier-1 snap rules (knowable constraints → round and tell) for the
+        FrequencyAnalysisSpecBase fields shared by the spectrogram and PSD
+        analyses: window / frequency_resolution / fractional_overlap /
+        window_fill / integration_bandwidth / lo_bandstop / trim_stopband.
+        `cfg_prefix` maps the message field onto the target's RadioConfig
+        attribute (e.g. "psd_" + "window"); `ack_prefix` labels the ack entries.
+        Returns (accepted, ack_field, requested_map) keyed by RadioConfig key.
+        """
+        accepted = {}          # cfg key -> validated value
+        ack_field = {}         # cfg key -> field name reported in the ack
+        requested_map = {}     # cfg key -> the raw requested value
+
+        def tell(field, requested, used, reason):
+            rounded.append({
+                "field": ack_prefix + field, "requested": requested,
+                "used": used, "reason": reason,
+            })
+
+        def reject(field, requested, reason):
+            rejected.append({"field": ack_prefix + field,
+                             "requested": requested, "reason": reason})
 
         # --- frequency_resolution: the second view of nfft (tier 1) ----------
         # cfg.nfft owns this quantity (P2a-1); an edit here snaps to the nearest
@@ -762,7 +810,8 @@ class SharedConfig:
                 nfft_snap = int(_snap(eff.sample_rate / fr, NFFT_CHOICES))
                 eff.nfft = nfft_snap
                 accepted["nfft"] = nfft_snap
-                ack_field["nfft"] = "frequency_resolution"
+                ack_field["nfft"] = ack_prefix + "frequency_resolution"
+                requested_map["nfft"] = requested
                 executed_nfft = aligned_nfft(nfft_snap) if on_calibrated_grid else nfft_snap
                 used = eff.sample_rate / executed_nfft
                 if abs(used - fr) > 1e-6 * max(fr, 1.0):
@@ -772,8 +821,7 @@ class SharedConfig:
                                    f"a 28-multiple, for window_fill integrality)")
                     tell("frequency_resolution", fr, used, reason)
             except (TypeError, ValueError) as e:
-                rejected.append({"field": "frequency_resolution",
-                                 "requested": requested, "reason": str(e)})
+                reject("frequency_resolution", requested, str(e))
 
         # Denominator grid for fraction snapping: the FFT size striqt executes.
         nfft_axis = aligned_nfft(eff.nfft) if on_calibrated_grid else int(eff.nfft)
@@ -793,12 +841,13 @@ class SharedConfig:
                 frac = _parse_fraction(requested)
                 k = min(max(round(frac * nfft_axis), lo_k), hi_k)
                 snapped = Fraction(k, nfft_axis)
-                accepted[key] = snapped
-                ack_field[key] = key
+                accepted[cfg_prefix + key] = snapped
+                ack_field[cfg_prefix + key] = ack_prefix + key
+                requested_map[cfg_prefix + key] = requested
                 if snapped != frac:
                     tell(key, str(requested), str(snapped), why)
             except ValueError as e:
-                rejected.append({"field": key, "requested": requested, "reason": str(e)})
+                reject(key, requested, str(e))
 
         # --- integration_bandwidth: multiple of freq_res, "auto", or none ----
         if "integration_bandwidth" in req and req["integration_bandwidth"] is not None:
@@ -806,21 +855,21 @@ class SharedConfig:
             try:
                 v = _parse_optional_hz(requested, auto_ok=True)
                 if v is None or isinstance(v, str):
-                    accepted["integration_bandwidth"] = v
+                    accepted[cfg_prefix + "integration_bandwidth"] = v
                 else:
                     if v < 0:
                         raise ValueError("integration_bandwidth must be positive, 'auto', or 'none'")
                     factor = min(max(1, round(v / freq_res)), nfft_axis)
                     used = factor * freq_res
-                    accepted["integration_bandwidth"] = used
+                    accepted[cfg_prefix + "integration_bandwidth"] = used
                     if abs(used - v) > 1e-6 * max(v, 1.0):
                         tell("integration_bandwidth", v, used,
                              f"must be an integer multiple of the {freq_res:.1f} Hz "
                              f"frequency resolution (striqt); using {factor} bins")
-                ack_field["integration_bandwidth"] = "integration_bandwidth"
+                ack_field[cfg_prefix + "integration_bandwidth"] = ack_prefix + "integration_bandwidth"
+                requested_map[cfg_prefix + "integration_bandwidth"] = requested
             except ValueError as e:
-                rejected.append({"field": "integration_bandwidth",
-                                 "requested": requested, "reason": str(e)})
+                reject("integration_bandwidth", requested, str(e))
 
         # --- lo_bandstop: positive Hz within the sampled span, or none --------
         if "lo_bandstop" in req and req["lo_bandstop"] is not None:
@@ -834,25 +883,58 @@ class SharedConfig:
                         tell("lo_bandstop", v, eff.sample_rate,
                              "cannot exceed the sampled span (sample_rate)")
                         v = float(eff.sample_rate)
-                accepted["lo_bandstop"] = v
-                ack_field["lo_bandstop"] = "lo_bandstop"
+                accepted[cfg_prefix + "lo_bandstop"] = v
+                ack_field[cfg_prefix + "lo_bandstop"] = ack_prefix + "lo_bandstop"
+                requested_map[cfg_prefix + "lo_bandstop"] = requested
             except ValueError as e:
-                rejected.append({"field": "lo_bandstop",
-                                 "requested": requested, "reason": str(e)})
+                reject("lo_bandstop", requested, str(e))
 
         # --- trim_stopband / window --------------------------------------------
         if "trim_stopband" in req and req["trim_stopband"] is not None:
-            accepted["trim_stopband"] = bool(req["trim_stopband"])
-            ack_field["trim_stopband"] = "trim_stopband"
+            accepted[cfg_prefix + "trim_stopband"] = bool(req["trim_stopband"])
+            ack_field[cfg_prefix + "trim_stopband"] = ack_prefix + "trim_stopband"
+            requested_map[cfg_prefix + "trim_stopband"] = req["trim_stopband"]
         if req.get("window") is not None:
             try:
-                accepted["window"] = _parse_window(req["window"])
-                ack_field["window"] = "window"
+                accepted[cfg_prefix + "window"] = _parse_window(req["window"])
+                ack_field[cfg_prefix + "window"] = ack_prefix + "window"
+                requested_map[cfg_prefix + "window"] = req["window"]
             except ValueError as e:
-                rejected.append({"field": "window",
-                                 "requested": req["window"], "reason": str(e)})
+                reject("window", req["window"], str(e))
 
-        supported = ANALYSIS_CFG_KEYS | {"frequency_resolution"}
+        return accepted, ack_field, requested_map
+
+    def _validate_analysis(self, update: dict):
+        """
+        Freedom-model gate (P2a-2, generalized across analysis targets in
+        P2b-1) for the "analysis" block of a control message. The block's
+        optional "target" key routes to the analysis being configured
+        (spectrogram is the default — the P2a wire format is unchanged).
+        Never mutates the live config — returns (survivors, rounded, rejected,
+        ignored) where `survivors` maps RadioConfig keys to values that passed
+        tier 1 (knowable rules → snap and tell) AND tier 2 (striqt scratch
+        validation on a tiny buffer). `rounded`/`rejected` are the ack entries:
+        [{field, requested, used, reason}] / [{field, requested, reason}].
+        """
+        req = dict(update.get("analysis") or {})
+        target = str(req.pop("target", "spectrogram") or "spectrogram").strip().lower()
+        rounded, rejected = [], []
+        if target not in ANALYSIS_TARGETS:
+            known = ", ".join(sorted(ANALYSIS_TARGETS))
+            rejected.append({"field": "target", "requested": target,
+                             "reason": f"unknown analysis target (known: {known})"})
+            return {}, rounded, rejected, []
+        spec = ANALYSIS_TARGETS[target]
+
+        eff = self._effective_radio(update)
+        on_calibrated_grid = eff.backend in {"calibrated", "ssb"}
+
+        # --- Tier 1: knowable rules, routed per target ------------------------
+        accepted, ack_field, requested_map = self._tier1_target(
+            target, req, eff, on_calibrated_grid, rounded, rejected
+        )
+
+        supported = set(spec["fields"]) | set(spec["virtual"])
         ignored = sorted(
             f"analysis.{k}" for k, v in req.items()
             if v is not None and k not in supported
@@ -863,23 +945,32 @@ class SharedConfig:
         # failure is attributed to the field that caused it; survivors keep
         # applying. The live config is untouched until update() commits the
         # survivors (never the rejects).
-        order = ("nfft", "window", "fractional_overlap", "window_fill",
-                 "integration_bandwidth", "lo_bandstop", "trim_stopband")
         candidate = eff.snapshot()
         survivors = {}
-        for key in (k for k in order if k in accepted):
+        for key in (k for k in spec["order"] if k in accepted):
             trial = candidate.snapshot()
             setattr(trial, key, accepted[key])
-            err = self.probe_analysis(trial)
+            err = self.probe_analysis(trial, target)
             if err is None:
                 candidate = trial
                 survivors[key] = accepted[key]
             else:
                 field = ack_field.get(key, key)
                 rejected.append({"field": field,
-                                 "requested": req.get(field), "reason": err})
+                                 "requested": requested_map.get(key), "reason": err})
                 rounded[:] = [r for r in rounded if r["field"] != field]
         return survivors, rounded, rejected, ignored
+
+    def _tier1_target(self, target, req, eff, on_calibrated_grid, rounded, rejected):
+        """Dispatch tier-1 validation for one analysis target. Returns
+        (accepted, ack_field, requested_map) keyed by RadioConfig key."""
+        if target == "spectrogram":
+            return self._tier1_freq_fields(
+                req, eff, cfg_prefix="", ack_prefix="",
+                on_calibrated_grid=on_calibrated_grid,
+                rounded=rounded, rejected=rejected,
+            )
+        raise RuntimeError(f"no tier-1 validator for analysis target {target!r}")
 
     def update(self, update: dict) -> dict:
         """

@@ -649,3 +649,25 @@ capture `analysis_bandwidth` 10 MHz + trim stopband shrinks the frame to 53 bins
 param visibly changes the calibrated spectrogram (window sidelobes, overlap row density,
 integration smoothing, LO notch width); a deliberately-illegal param is caught and reported
 without killing the live feed.
+
+### P2b-1 — Freedom model generalized to analysis targets
+**Files:** `live/striqt_web_server.py`
+**Changed:** Refactors the P2a validation machinery so the SAME three tiers can govern every
+analysis (spectrogram / PSD / SSB) instead of only the calibrated spectrogram — no second,
+parallel validation path. New `ANALYSIS_TARGETS` descriptor table maps each target's message
+fields onto `RadioConfig` attributes and fixes its tier-2 application order;
+`ANALYSIS_CFG_KEYS` (top-level strip + backstop key set) is now derived as the union across
+targets. The `"analysis"` control block gains an optional `"target"` key (routing; unknown
+targets are rejected with the known list); no target means `"spectrogram"`, so the P2a wire
+format is unchanged. `scratch_validate_analysis` became a `SCRATCH_VALIDATORS[target]`
+dispatcher (the P2a validator is now `scratch_validate_spectrogram`), and the compute-thread
+probe mailbox (`probe_analysis`/`service_probe`) carries the target through. The tier-1 rules
+for the `FrequencyAnalysisSpecBase` fields shared by spectrogram and PSD moved into
+`_tier1_freq_fields(cfg_prefix, ack_prefix, …)` so later targets reuse them verbatim against
+prefixed cfg keys. Behavior for existing clients is unchanged (pure refactor).
+
+**Verify [demo]:** with the vendored striqt on the path, a probe-servicer harness reproduces
+the exact P2a acks: `window: hann` applies; `notawindow` is rejected with the striqt reason;
+`fractional_overlap: 0.463` rounds to `467/1008`; `frequency_resolution: 7000` snaps nfft
+1024→2048 with the 2016-grid note; `{"target": "nonsense"}` rejects with the known-target
+list. **Verify [hardware]:** none needed beyond P2a's (no behavior change).
