@@ -42,3 +42,23 @@ ALIGNED_NFFTS)` (done here, passes); run `--demo --backend calibrated` and confi
 (bins) is 83 at FFT 1024 and the meta fps rises; on hardware time one `calibrated_spectrogram`
 call before/after (wrap with `time.perf_counter` temporarily) — expect ≥3× faster at 1008 vs
 1036 for the same rows.
+
+### LV-W2 — Right-size STFT rows/samples (stop computing ~1.87× the rows we display)
+**File:** `live/striqt_web_server.py`
+**Changed:** Added helper `calibrated_sample_count(nfft, rows) = rows·hop + (nfft-hop)`,
+`hop = nfft·15//28`. `samples_needed` now uses it for the `calibrated`/`ssb` base (was
+`nfft·rows`); quicklook stays `nfft·rows`; the SSB discovery-period `max()` floor is unchanged.
+**Also right-sized `calibrated_spectrogram`'s internal `needed`** from `rows·nfft` to the same
+helper — required, and beyond the samples-only handoff: `calibrated_spectrogram` re-derives
+`needed = rows·nfft` and pads/truncates to it, so cutting only `samples_needed` would have
+zero-padded the newest rows into garbage (the finding's own risk note assumes the reduced count
+reaches `evaluate_spectrogram`). Proven locally against striqt's real striding row count
+(`sliding_window_view(x, nfft)` stepped by `hop`): `floor((N-nfft)/hop)+1` == `rows` **exactly**
+for every aligned nfft at rows ∈ {12,60,300}, with ~46% fewer samples/FFTs at 300 rows — so no
+front-pad and frames are unchanged.
+
+**Verify [demo]/[hardware]:** demo: displayed rows unchanged (header `rows` identical), server
+CPU per frame drops (log timestamps); assert in a REPL that `evaluate_spectrogram` on the new
+sample count returns ≥ rows STFT rows (it returns exactly `int((28/15)(N/nfft−1))+1`; with N as
+above that is ≥ rows). [demo] confirms frames identical + header rows unchanged; [hardware]
+confirms the per-frame CPU drop.

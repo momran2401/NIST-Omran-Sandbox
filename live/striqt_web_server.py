@@ -653,7 +653,9 @@ def calibrated_spectrogram(
 
     samples = np.asarray(samples, dtype=np.complex64)
     nfft = aligned_nfft(nfft)
-    needed  = rows * nfft
+    # Right-size to exactly `rows` STFT rows under the 13/28 overlap, rather than
+    # computing ~1.87×rows rows and discarding all but the last `rows` (LV-W2).
+    needed  = calibrated_sample_count(nfft, rows)
     if samples.shape[1] < needed:
         pad = np.zeros((samples.shape[0], needed - samples.shape[1]), dtype=np.complex64)
         samples = np.concatenate([samples, pad], axis=1)
@@ -747,6 +749,20 @@ def averaging_factor(nfft: int) -> int:
     return 1
 
 
+def calibrated_sample_count(nfft: int, rows: int) -> int:
+    """
+    Samples needed to produce exactly `rows` STFT rows under the 13/28 overlap.
+    Each displayed row advances the STFT by hop = nfft·15/28 samples, so
+    rows·hop + (nfft-hop) samples suffice — instead of the ~1.87× that rows·nfft
+    would compute and then discard (see AUDIT_REPORT.md LV-W2). `nfft` must be an
+    aligned FFT size (multiple of 28) so the hop divides evenly; the count then
+    reproduces striqt's own row formula int((nfft/hop)·(N/nfft-1)+1) == rows.
+    """
+    nfft = int(nfft)
+    hop = (nfft * 15) // 28
+    return int(rows * hop + (nfft - hop))
+
+
 def fit_display_rows(spg: np.ndarray, rows: int) -> np.ndarray:
     """Crop/pad a striqt spectrogram to the dashboard row contract."""
     spg = np.asarray(spg, dtype=np.float32)
@@ -773,8 +789,12 @@ def fit_display_rows(spg: np.ndarray, rows: int) -> np.ndarray:
 
 
 def samples_needed(cfg: RadioConfig) -> int:
-    nfft = aligned_nfft(cfg.nfft) if cfg.backend in {"calibrated", "ssb"} else cfg.nfft
-    base = int(nfft * cfg.rows)
+    if cfg.backend in {"calibrated", "ssb"}:
+        # Overlapped STFT: only rows·hop + (nfft-hop) samples are needed to
+        # produce cfg.rows display rows (LV-W2), not the full nfft·rows.
+        base = calibrated_sample_count(aligned_nfft(cfg.nfft), cfg.rows)
+    else:
+        base = int(cfg.nfft * cfg.rows)
     if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate):
         ssb = int(math.ceil(SSB_DISCOVERY_PERIOD * cfg.sample_rate))
         return max(base, ssb)
