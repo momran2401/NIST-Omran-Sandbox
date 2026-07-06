@@ -595,3 +595,32 @@ an explicit rows control zeroes duration and later nfft changes leave rows alone
 clamps to the ring bound (3744). All confirmed offline; on 8001 the `↕ ms` label matches the
 selected duration exactly. **Verify [hardware]:** the armed capture duration follows the
 Duration control (radio log line), and the label stays truthful across nfft changes.
+
+### P2a-5 — /config endpoint, server-seeded forms, and compute-thread tier-2 probes
+**Files:** `live/striqt_web_server.py`, `live/web/app.js`
+**Changed (server):** New `GET /config` returns the live `RadioConfig` as JSON — a `capture`
+view (center_frequency, sample_rate, gain, the four P1-2 knobs, duration, nfft) and an
+`analysis` view (window, executed frequency_resolution, overlap/fill as fraction strings,
+integration_bandwidth, lo_bandstop, trim_stopband) plus backend/rows/lo_null.
+**Changed (client):** `loadSchema()` now seeds the Capture form from `/config` instead of the
+striqt schema defaults, fixing the Phase-1 bug where a bare Apply silently flipped untouched
+fields whose schema default differs from the server default (e.g. `host_resample` true vs
+false). The FFT select (+ `radioNfft`) and Duration control also seed from it. Every settings
+ack triggers a debounced `/config` re-fetch so the forms and `radioNfft` re-sync with what the
+server actually runs after rounding. `handleAck` surfaces the P2a-2 structured ack: rounded →
+`invalid X=… → using Y (reason)` log lines + an "adjusted …" status; rejected → ERROR log lines
++ a "rejected … — kept last-good config" status. Idle `ping` keepalives no longer spam the log.
+**Fix discovered by live testing:** striqt's `get_window` carries a persistent on-disk cache
+whose handle binds to the thread that first uses it (Python ≥3.13 `dbm.sqlite3` refuses
+cross-thread use), so tier-2 probes run from the WebSocket thread falsely rejected legal NEW
+windows with a SQLite threading error. Probes now execute **on the compute thread** (Computer /
+DemoAcquirer service a single-slot mailbox each loop, `SharedConfig.probe_analysis`/
+`service_probe`), with an inline fallback if unserviced for 2 s; `ws_endpoint` runs
+`SharedConfig.update` in an executor so a multi-field apply cannot stall the broadcaster. This
+is also the correct home on the radio's own striqt build regardless of its dbm backend.
+
+**Verify [demo]:** `/config` mirrors every applied change; on 8001 `{"analysis":{"window":
+"hann"}}` now applies (was falsely rejected), `notawindow` is rejected with the real striqt
+reason, and a bare Apply after page load changes nothing (`applied []`). A no-striqt stock
+`python3 --demo` boot still works (quicklook, tier 2 a no-op). **Verify [hardware]:** apply a
+new window on the installed build — no SQLite/threading rejection; `/config` reflects it.

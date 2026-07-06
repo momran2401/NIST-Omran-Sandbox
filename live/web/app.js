@@ -221,7 +221,13 @@ function connect() {
         if (typeof e.data === "string") {
             try {
                 const msg = JSON.parse(e.data);
-                if (msg.message) logMsg(msg.message);
+                if (msg.message && msg.message !== "ping") logMsg(msg.message);
+                if (msg.ack) {
+                    handleAck(msg.ack);
+                    // Re-sync forms + radioNfft with what the server actually
+                    // runs (it may have rounded or rejected inputs) — P2a-5.
+                    scheduleConfigRefresh();
+                }
             } catch (_) {}
             return;
         }
@@ -251,6 +257,33 @@ function connect() {
 function sendControl(ctrl) {
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(ctrl));
+    }
+}
+
+// Surface the server's structured settings ack (P2a-2): what applied cleanly,
+// what was rounded to a legal value ("invalid X → using Y"), what striqt
+// rejected (last-good config kept). Rounded/rejected also land in the status
+// line so the user sees it without watching the log.
+function fmtAckValue(v) {
+    if (typeof v === "number" && isFinite(v) && Math.abs(v) >= 1000) {
+        return v.toLocaleString("en-US", { maximumFractionDigits: 1 });
+    }
+    return String(v);
+}
+
+function handleAck(ack) {
+    const rounded  = ack.rounded  || [];
+    const rejected = ack.rejected || [];
+    for (const r of rounded) {
+        logMsg(`invalid ${r.field}=${fmtAckValue(r.requested)} → using ${fmtAckValue(r.used)} (${r.reason})`, "WARN");
+    }
+    for (const r of rejected) {
+        logMsg(`rejected ${r.field}=${fmtAckValue(r.requested)}: ${r.reason}`, "ERROR");
+    }
+    if (rejected.length) {
+        setStatus(`rejected ${rejected.map((r) => r.field).join(", ")} — kept last-good config`, "error");
+    } else if (rounded.length) {
+        setStatus(`adjusted ${rounded.map((r) => r.field).join(", ")} to legal values`, "warn");
     }
 }
 
@@ -1265,10 +1298,88 @@ function collectSettings() {
     return payload;
 }
 
-async function loadSchema(seed = {}) {
+// ---------------------------------------------------------------------------
+// Server-config seeding (P2a-5)
+// ---------------------------------------------------------------------------
+//
+// Forms seed from the server's CURRENT config (/config), not the striqt schema
+// defaults, so a bare Apply re-sends exactly what the server already runs — no
+// silent flips of untouched fields (e.g. schema host_resample=true vs server
+// false). Also the re-sync path after every settings/analysis ack, which keeps
+// radioNfft and the panel values honest when the server rounds an input.
+
+async function fetchConfig() {
+    const resp = await fetch("/config", { cache: "no-store" });
+    if (!resp.ok) throw new Error(`config HTTP ${resp.status}`);
+    return resp.json();
+}
+
+function seedStaticControls(config) {
+    const cap = (config && config.capture) || {};
+    if (cap.nfft) {
+        radioNfft = cap.nfft;   // /config re-sync — the other radioNfft updater
+        const sel = document.getElementById("nfft-sel");
+        if (sel) sel.value = String(cap.nfft);
+    }
+    if (cap.duration) {
+        const ms = cap.duration * 1000;
+        windowMs = ms;
+        const preset = Array.from(durSel.options)
+            .map((o) => o.value)
+            .find((v) => parseFloat(v) === ms);
+        if (preset) {
+            durSel.value = preset;
+            durCustomLabel.style.display = "none";
+        } else {
+            durSel.value = "custom";
+            durCustom.value = String(ms);
+            if (document.body.classList.contains("mode-pro")) {
+                durCustomLabel.style.display = "";
+            }
+        }
+    }
+}
+
+function seedCaptureForm(config) {
+    const cap = (config && config.capture) || {};
+    document.querySelectorAll("#capture-settings-form input, #capture-settings-form select")
+        .forEach((input) => {
+            const name = input.dataset.field;
+            if (name in cap) setFieldValue(input, cap[name]);
+        });
+}
+
+let configRefreshTimer = null;
+function scheduleConfigRefresh() {
+    if (configRefreshTimer) return;
+    configRefreshTimer = setTimeout(async () => {
+        configRefreshTimer = null;
+        try {
+            const config = await fetchConfig();
+            seedStaticControls(config);
+            seedCaptureForm(config);
+            if (typeof seedAnalysisForm === "function") seedAnalysisForm(config);
+        } catch (_) { /* transient — next ack retries */ }
+    }, 250);
+}
+
+async function loadSchema(seed = null) {
     const resp = await fetch("/schema", { cache: "no-store" });
     if (!resp.ok) throw new Error(`schema HTTP ${resp.status}`);
-    renderSettings(await resp.json(), seed);
+    const schema = await resp.json();
+    let effSeed = seed;
+    if (!effSeed) {
+        try {
+            const config = await fetchConfig();
+            effSeed = { captures: [config.capture || {}], source: {} };
+            seedStaticControls(config);
+            if (typeof seedAnalysisForm === "function") seedAnalysisForm(config);
+        } catch (err) {
+            logMsg(`Config load failed (${err.message}); using schema defaults`, "WARN");
+            effSeed = {};
+        }
+    }
+    renderSettings(schema, effSeed);
 }
 
 document.getElementById("settings-apply").addEventListener("click", () => {

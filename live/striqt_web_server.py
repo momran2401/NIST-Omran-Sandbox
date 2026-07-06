@@ -611,6 +611,15 @@ class SharedConfig:
         # demonstrably computed a frame, and notices queued for the viewers.
         self._last_good_analysis = None
         self._notices = []
+        # Tier-2 probe handoff (P2a-5): striqt's persistent window cache is a
+        # process-wide shelf that (on dbm.sqlite3 Pythons) is bound to the
+        # thread that first used it — the compute thread. Scratch validations
+        # therefore run THERE, posted through this single-slot mailbox.
+        self._probe_lock = threading.Lock()   # serializes probers
+        self._probe_req  = None               # (seq, RadioConfig) or None
+        self._probe_res  = None               # (seq, verdict)
+        self._probe_seq  = 0
+        self._probe_done = threading.Event()
 
     def snapshot(self):
         with self._lock:
@@ -658,6 +667,40 @@ class SharedConfig:
             f"analysis error: {reason} — reverted {', '.join(changed)} to last-good values"
         )
         return changed
+
+    def probe_analysis(self, trial_cfg: "RadioConfig"):
+        """
+        Tier-2 scratch validation, executed on the compute thread. striqt's
+        get_window carries a persistent on-disk cache whose handle is bound to
+        the thread that first used it (dbm.sqlite3 refuses cross-thread use);
+        the compute thread is that owner, so verdicts from anywhere else could
+        report a spurious threading error instead of the real one. Falls back
+        to an inline judgement if no compute thread services the request in
+        time (startup) — the tier-3 backstop still protects the stream.
+        """
+        if not _ANALYSIS_OK:
+            return None
+        with self._probe_lock:
+            self._probe_seq += 1
+            seq = self._probe_seq
+            self._probe_done.clear()
+            self._probe_req = (seq, trial_cfg)
+            if self._probe_done.wait(2.0):
+                res = self._probe_res
+                if res and res[0] == seq:
+                    return res[1]
+            self._probe_req = None
+            return scratch_validate_analysis(trial_cfg)
+
+    def service_probe(self):
+        """Called by the compute thread every loop: run a pending tier-2 probe."""
+        job = self._probe_req
+        if job is None:
+            return
+        self._probe_req = None
+        seq, trial_cfg = job
+        self._probe_res = (seq, scratch_validate_analysis(trial_cfg))
+        self._probe_done.set()
 
     def push_notice(self, message: str):
         with self._lock:
@@ -827,7 +870,7 @@ class SharedConfig:
         for key in (k for k in order if k in accepted):
             trial = candidate.snapshot()
             setattr(trial, key, accepted[key])
-            err = scratch_validate_analysis(trial)
+            err = self.probe_analysis(trial)
             if err is None:
                 candidate = trial
                 survivors[key] = accepted[key]
@@ -1827,6 +1870,9 @@ class Computer(threading.Thread):
         interval = 1.0 / max(BROADCAST_FPS, 1.0)
         next_t   = time.time()
         while not self.shared.stopped():
+            # Serve any pending tier-2 validation probe first: this thread owns
+            # striqt's thread-bound persistent window cache (P2a-5).
+            self.shared.service_probe()
             cfg     = self.shared.snapshot()
             need    = samples_needed(cfg)
             g0      = self.acquirer.generation()
@@ -1913,6 +1959,9 @@ class DemoAcquirer(threading.Thread):
         interval = 1.0 / max(BROADCAST_FPS, 1.0)
         next_t = time.time()
         while not self.shared.stopped():
+            # This is the compute thread in demo mode — serve tier-2 probes here
+            # for the same thread-bound-cache reason as the Computer (P2a-5).
+            self.shared.service_probe()
             cfg = self.shared.snapshot()
             n   = samples_needed(cfg)
             t   = np.arange(n, dtype=np.float32) / cfg.sample_rate
@@ -2079,6 +2128,53 @@ async def schema_endpoint():
     return JSONResponse(capture_editor_schema())
 
 
+def current_config():
+    """
+    JSON view of the live RadioConfig (P2a-5). The browser seeds its forms from
+    this instead of the striqt schema defaults, so a bare Apply re-sends the
+    server's own values — no more silent flips of untouched fields whose schema
+    default differs from the server default (e.g. host_resample true vs false).
+    Also the re-sync source after every settings/analysis ack.
+    """
+    cfg = _shared.snapshot()
+    on_calibrated_grid = cfg.backend in {"calibrated", "ssb"}
+    nfft_exec = aligned_nfft(cfg.nfft) if on_calibrated_grid else int(cfg.nfft)
+    window = list(cfg.window) if isinstance(cfg.window, tuple) else cfg.window
+    integration = cfg.integration_bandwidth
+    if not (integration is None or isinstance(integration, str)):
+        integration = float(integration)
+    return _json_safe({
+        "capture": {
+            "center_frequency":    float(cfg.center),
+            "sample_rate":         float(cfg.sample_rate),
+            "gain":                float(cfg.gain),
+            "analysis_bandwidth":  float(cfg.analysis_bandwidth),
+            "lo_shift":            str(cfg.lo_shift),
+            "host_resample":       bool(cfg.host_resample),
+            "backend_sample_rate": float(cfg.backend_sample_rate),
+            "duration":            float(cfg.duration),
+            "nfft":                int(cfg.nfft),
+        },
+        "analysis": {
+            "window":                window,
+            "frequency_resolution":  float(cfg.sample_rate) / nfft_exec,
+            "fractional_overlap":    str(cfg.fractional_overlap),
+            "window_fill":           str(cfg.window_fill),
+            "integration_bandwidth": integration,
+            "lo_bandstop":           float(cfg.lo_bandstop) if cfg.lo_bandstop else None,
+            "trim_stopband":         bool(cfg.trim_stopband),
+        },
+        "backend": str(cfg.backend),
+        "rows":    int(cfg.rows),
+        "lo_null": bool(cfg.lo_null),
+    })
+
+
+@app.get("/config")
+async def config_endpoint():
+    return JSONResponse(current_config())
+
+
 async def _broadcaster():
     """
     Polls acquirer.latest() at BROADCAST_FPS, serializes the frame once, and
@@ -2193,7 +2289,12 @@ async def ws_endpoint(ws: WebSocket):
                 continue
             try:
                 ctrl = json.loads(text)
-                ack = _shared.update(ctrl)
+                # Run in a worker thread: an analysis apply blocks on tier-2
+                # probes serviced by the compute thread (up to ~0.1 s per
+                # field), which must not stall the event loop / broadcaster.
+                ack = await asyncio.get_running_loop().run_in_executor(
+                    None, _shared.update, ctrl
+                )
                 # Acknowledge settings/analysis applies so the UI can show what
                 # took effect vs what was rounded, rejected, ignored, or needs a
                 # reconnect (LV-F6, P2a-2). The structured ack rides along so
