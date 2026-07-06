@@ -1010,10 +1010,35 @@ document.getElementById("analysis-sel").addEventListener("change", (e) => {
     applyAnalysisMode();
 });
 
-document.getElementById("win-sel").addEventListener("change", (e) => {
-    windowMs = parseInt(e.target.value, 10);
+// Duration control (P1-4) — the single owner of the time axis. Presets are
+// available in both modes; the "custom…" option + number box are DAN-only. The
+// value is in ms; it drives `windowMs`, which sizes the display window exactly
+// like the old Window control (hop-aware `rowsForCurrentSettings`). In replace
+// (Boring) mode the server sends `rows`, so push the new count; in scroll (Cool)
+// mode the client display depth follows `windowMs` via computeDisplayDepth.
+const durSel         = document.getElementById("dur-sel");
+const durCustomLabel = document.getElementById("dur-custom-label");
+const durCustom      = document.getElementById("dur-custom");
+
+function applyDuration() {
+    const proMode = document.body.classList.contains("mode-pro");
+    let ms;
+    if (durSel.value === "custom" && proMode) {
+        durCustomLabel.style.display = "";
+        ms = parseFloat(durCustom.value);
+    } else {
+        durCustomLabel.style.display = "none";
+        ms = parseFloat(durSel.value);   // NaN if "custom" reached outside DAN
+    }
+    if (!isFinite(ms) || ms <= 0) return;
+    windowMs = ms;
     if (replaceMode) sendControl({ rows: rowsForCurrentSettings() });
-});
+    updateMeta();
+}
+
+durSel.addEventListener("change", applyDuration);
+durCustom.addEventListener("change", applyDuration);
+durCustom.addEventListener("input", applyDuration);
 
 document.getElementById("fps-sel").addEventListener("change", (e) => {
     maxFps = parseFloat(e.target.value) || 15;   // client-side render cap (LV-U1a)
@@ -1088,8 +1113,11 @@ const SOURCE_SKIP = new Set(["receive_retries", "adc_overload_limit", "if_overlo
 // `port` is intentionally excluded — it is fixed at both RX ports server-side
 // (make_capture) because the two-waterfall UI depends on it (P1-2). The four
 // analysis knobs are now wired through to the radio on the next re-arm.
+// `duration` is intentionally excluded — the Display "Duration (ms)" control is
+// the single owner of the time axis (P1-4). Keeping it here too would let two
+// controls fight over `rows` (the old Window-vs-duration bug).
 const captureFields = [
-    "center_frequency", "sample_rate", "gain", "duration", "analysis_bandwidth",
+    "center_frequency", "sample_rate", "gain", "analysis_bandwidth",
     "lo_shift", "host_resample", "backend_sample_rate",
 ];
 const sourceFields = [

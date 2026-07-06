@@ -63,16 +63,19 @@
             </select>
         </label>
 
-        <label class="pro-only">Window (ms)
-            <select id="win-sel">
+        <label title="Displayed time span — drives the number of waterfall rows">Duration (ms)
+            <select id="dur-sel">
+                <option value="2">2</option>
+                <option value="5">5</option>
                 <option value="10">10</option>
                 <option value="20" selected>20</option>
                 <option value="50">50</option>
                 <option value="100">100</option>
-                <option value="200">200</option>
-                <option value="500">500</option>
-                <option value="1000">1000</option>
+                <option value="custom" class="pro-only">custom…</option>
             </select>
+        </label>
+        <label class="pro-only" id="dur-custom-label" style="display:none">Custom (ms)
+            <input type="number" id="dur-custom" min="1" step="1" value="20">
         </label>
 
         <label class="pro-only" title="Cap the browser render rate (drops excess frames)">Max fps

@@ -421,3 +421,29 @@ band-drag selection stays (still drives the band monitor). The NOOB station tune
 FFT from the new select retunes the radio (the `applied` ack lists them; waterfall/labels update).
 Confirmed structurally: served HTML has no `radio-ctrl`/`tune-btn`; `#nfft-sel` lives in
 `.settings-static`; a WS `{nfft:2048}` yields frames with `nfft=2048`.
+
+### P1-4 — Replace Window (ms) with a Duration control (preset + custom)
+**Files:** `live/web/index.html`, `live/web/app.js`
+**Changed:** Removed the `Window (ms)` `#win-sel` control and its handler. Added a **Duration (ms)**
+control to the Display row: a `#dur-sel` `<select>` of presets **2/5/10/20/50/100 ms** plus a
+final **custom…** option, and a `#dur-custom` number box revealed when custom is chosen. The
+preset select is available in **both** modes; the `custom…` option and the number box are
+`pro-only` (DAN only). Duration is the **single owner of the time axis**: `applyDuration()` sets
+the existing `windowMs` (ms), which drives the display window via the hop-aware
+`rowsForCurrentSettings()` exactly as the old Window control did — so the `↕ N ms` waterfall-axis
+label and the meta `window … ms` track the selection. In replace (Boring) mode it sends
+`{rows}`; in scroll (Cool) mode the client depth follows `windowMs`. `duration` was removed from
+the schema-form `captureFields` so exactly one duration input owns `rows` (kills the old
+Window-vs-duration fight).
+**Deviation (noted):** the control sends `{rows}` (client-computed, hop-aware) rather than a raw
+`{duration: seconds}` message. The server has no hop-aware duration→rows mapping (its
+`capture.duration` path uses `duration·fs/nfft` with **no** 15/28 hop factor), so sending raw
+duration would desync the `↕ ms` label from the real window and break the LV-W1/LV-W2 time-axis
+contract. `{rows}` is the proven, contract-preserving path; `cfg.rows` still drives the radio's
+capture `duration` in `make_capture`, so the hardware captures the right span.
+**Depends on P1-5:** presets above ~10–20 ms exceed the old 300-row cap and are clamped until
+P1-5 raises it; after P1-5 the full 2→100 ms range renders honestly.
+
+**Verify [demo]:** picking each preset changes the displayed time span (and the `↕ N ms` label);
+"custom…" reveals the box and a typed value applies. In ARIC mode only the presets are offered
+(no custom box).
