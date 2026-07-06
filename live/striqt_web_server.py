@@ -303,17 +303,27 @@ class BasicAuthMiddleware:
         self.app = app
 
     @staticmethod
-    def _set_cookie_send(send):
+    def _set_cookie_send(scope, send):
         """
         Wrap `send` to append a Set-Cookie header carrying a fresh session token
         on the HTTP response start. Only the success path uses this, so the
-        cookie is never attached to a 401.
+        cookie is never attached to a 401. The `Secure` attribute is omitted over
+        plain HTTP (LAN) so Safari/iOS — which refuse to store a Secure cookie
+        without TLS and won't replay Basic on the WS upgrade — can still reach /ws
+        (LV-R8). HttpOnly and SameSite=Lax are always set.
         """
+        headers_in = dict(scope.get("headers") or [])
+        is_https = (
+            scope.get("scheme") == "https"
+            or headers_in.get(b"x-forwarded-proto") == b"https"
+        )
+        secure_attr = "Secure; " if is_https else ""
+
         async def wrapped(message):
             if message["type"] == "http.response.start":
                 cookie = (
                     f"radio_auth={make_session_token()}; Path=/; HttpOnly; "
-                    f"Secure; SameSite=Lax; Max-Age={SESSION_TTL}"
+                    f"{secure_attr}SameSite=Lax; Max-Age={SESSION_TTL}"
                 )
                 headers = list(message.get("headers") or [])
                 headers.append((b"set-cookie", cookie.encode("latin-1")))
@@ -335,7 +345,7 @@ class BasicAuthMiddleware:
             if scope["type"] == "http":
                 # Refresh the session cookie so the browser carries it on the
                 # WS handshake. Never set it on websocket scopes.
-                await self.app(scope, receive, self._set_cookie_send(send))
+                await self.app(scope, receive, self._set_cookie_send(scope, send))
             else:
                 await self.app(scope, receive, send)
             return

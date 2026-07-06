@@ -290,3 +290,16 @@ making time continuous across band boundaries.
 
 **Verify [demo]:** in Cool Mode, temporarily modulate a demo tone on/off in `DemoAcquirer` — pulse
 stripes must form continuous diagonals across frame boundaries, not a sawtooth; revert the edit.
+
+### LV-R8 — Drop the `Secure` session cookie over plain HTTP (iOS/Safari LAN lockout)
+**File:** `live/striqt_web_server.py`
+**Changed:** `BasicAuthMiddleware._set_cookie_send` now takes the ASGI `scope` and omits the
+`Secure;` cookie attribute unless the request is HTTPS (`scope["scheme"] == "https"` or
+`x-forwarded-proto: https`). Over `http://<radio-ip>` on the LAN, Safari/iOS refused to store a
+`Secure` cookie *and* won't replay Basic on the WS upgrade — locking out exactly the clients the
+cookie exists for. `HttpOnly` and `SameSite=Lax` stay unconditional; via the HTTPS tunnel `Secure`
+is still present. Verified the decision table (plain-http→no Secure; https/tunnel→Secure).
+
+**Verify [demo]:** with `RADIO_USER`/`RADIO_PASS` set, `curl -v http://localhost:8001/ -u user:pass`
+shows `Set-Cookie` without `Secure`; via an HTTPS tunnel the `Secure` attribute is present. On an
+iPhone on LAN http, page login → live frames.
