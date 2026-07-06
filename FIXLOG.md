@@ -189,3 +189,19 @@ True) gating only the overwrite, and a "LO null" checkbox in the Display group w
 **Verify [demo]:** calibrated mode — the checkbox toggles the center stripe; at FFT 256 the null
 shrinks from 5 bins toward the minimum; with the null off, no NaN garbage appears under
 `--quantize`.
+
+---
+
+## Cluster 3 — Robustness bugs
+
+### LV-R1 — Catch bare `RuntimeError` from the Soapy driver in the acquirer read loops
+**Files:** `live/striqt_web_server.py`, `live/striqt_standalone.py`, `live/pluto_standalone.py`,
+`live/striqt_standalone_terminal.py`
+**Changed:** SoapySDR's C++ layer can surface a bare `RuntimeError` mid-read; an uncaught one
+unwinds the acquirer thread and freezes the viewer permanently. Widened the read-loop `except`
+from `(ReceiveStreamError, OverflowError, OSError)` to add `RuntimeError` in all four scripts, so
+a driver fault routes to the existing `_recover`/retry path instead of killing the thread.
+
+**Verify [hardware]:** monkeypatch `_read_stream` to raise `RuntimeError("injected")` once (a
+temporary shim around the read in a dev run); the log shows `[radio] recovering after: injected`
+and frames resume. (Not reproducible in `--demo`, which uses `DemoAcquirer` with no read loop.)

@@ -1127,7 +1127,7 @@ class Acquirer(threading.Thread):
                         timeout_sec=read_size / cfg.sample_rate + 0.1,
                         on_overflow="log",
                     )
-                except (ReceiveStreamError, OverflowError, OSError) as e:
+                except (ReceiveStreamError, OverflowError, OSError, RuntimeError) as e:
                     try:
                         read_size, tmp, buffers = self._recover(cfg, str(e))
                     except Exception as re:
