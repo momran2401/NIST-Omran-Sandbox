@@ -1176,7 +1176,17 @@ async function loadSchema(seed = {}) {
 }
 
 document.getElementById("settings-apply").addEventListener("click", () => {
-    sendControl(collectSettings());
+    // Merge the hidden lower-level params from an uploaded sweep JSON under the
+    // visible form values (form wins), so uploading a sweep actually seeds them
+    // instead of being silently dropped (LV-F6).
+    const form = collectSettings();
+    const hiddenCapture = (hiddenSweepSettings.captures && hiddenSweepSettings.captures[0]) || {};
+    const hiddenSource  = hiddenSweepSettings.source || {};
+    const payload = {
+        capture: { ...hiddenCapture, ...form.capture },
+        source:  { ...hiddenSource,  ...form.source  },
+    };
+    sendControl(payload);
     logMsg("Settings sent");
 });
 

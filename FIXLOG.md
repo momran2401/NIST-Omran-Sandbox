@@ -143,3 +143,21 @@ pass (per the finding).
 
 **Verify [demo]:** selecting Quicklook changes `header.backend` to `"quicklook"`, the DC spike
 appears (no LO null), and levels drop ~8–9 dB (per-bin vs band-integrated — now labeled by LV-F4).
+
+### LV-F6 — Settings editor: send hidden sweep params; ack applied/ignored/reconnect
+**Files:** `live/striqt_web_server.py`, `live/web/app.js`, `live/web/index.html`
+**Changed:** (1) `app.js` #settings-apply now deep-merges `hiddenSweepSettings` (the uploaded sweep
+JSON's `captures[0]`/`source`) under the visible form values (form wins) before sending, so the
+"hidden lower-level parameters" are actually applied instead of dropped. (2) `SharedConfig.update`
+returns an ack `{applied, ignored, reconnect}` — `applied` = internal cfg keys that changed,
+`ignored` = capture fields with no live mapping (analysis_bandwidth, port, lo_shift, host_resample,
+backend_sample_rate), `reconnect` = source fields minus the skip set; `ws_endpoint` sends it back
+as a `{message}` text frame **only** for settings-editor applies (messages containing `capture`/
+`source`), which `app.js` already logs — avoids spamming the log on every slider change. (3)
+`index.html` source badge → "requires reconnect — not applied live". Confirmed the ack lists
+compute correctly on a representative payload.
+
+**Verify [demo]:** upload a sweep JSON (Dan's §4 sample; `context/` is not in this sandbox clone,
+so any valid sweep JSON with a `center_frequency` works) via Load JSON, press Apply, and check the
+browser Log panel lists the three categories (applied/ignored/reconnect-only) and the radio
+retunes to the file's `center_frequency`.

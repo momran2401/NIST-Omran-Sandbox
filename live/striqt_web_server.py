@@ -413,8 +413,13 @@ class SharedConfig:
         with self._lock:
             return self._cfg.snapshot()
 
-    def update(self, update: dict) -> bool:
-        """Apply key/value updates. Returns True if anything changed."""
+    def update(self, update: dict) -> dict:
+        """Apply key/value updates. Returns an ack {applied, ignored, reconnect}."""
+        ignored = []
+        reconnect = []
+        # Capture fields that map to a live radio parameter; the rest are rendered
+        # by the editor but cannot be applied live — reported, not dropped (LV-F6).
+        capture_mapped = {"center_frequency", "sample_rate", "gain", "duration"}
         if "capture" in update and isinstance(update["capture"], dict):
             capture = update["capture"]
             mapped = {}
@@ -433,15 +438,18 @@ class SharedConfig:
                     mapped["rows"] = max(1, min(rows, MAX_LIVE_ROWS))
                 except Exception:
                     pass
+            ignored = sorted(
+                k for k, v in capture.items() if v is not None and k not in capture_mapped
+            )
             update = dict(update)
             update.update(mapped)
 
         if "source" in update and isinstance(update["source"], dict):
-            allowed = sorted(k for k in update["source"] if k not in {
+            reconnect = sorted(k for k, v in update["source"].items() if v is not None and k not in {
                 "receive_retries", "adc_overload_limit", "if_overload_limit", "gapless",
             })
-            if allowed:
-                print(f"[config] source changes require reconnect: {allowed}")
+            if reconnect:
+                print(f"[config] source changes require reconnect: {reconnect}")
 
         valid = {"center", "sample_rate", "gain", "nfft", "rows", "backend"}
         changes = []
@@ -476,7 +484,7 @@ class SharedConfig:
         # Print outside the lock to avoid I/O inside a mutex
         for key, old, value in changes:
             print(f"[config] {key}: {old} -> {value}")
-        return bool(changes)
+        return {"applied": [k for k, _, _ in changes], "ignored": ignored, "reconnect": reconnect}
 
     def take_dirty(self):
         with self._lock:
@@ -1437,7 +1445,13 @@ async def ws_endpoint(ws: WebSocket):
             try:
                 text = await asyncio.wait_for(ws.receive_text(), timeout=15.0)
                 ctrl = json.loads(text)
-                _shared.update(ctrl)
+                ack = _shared.update(ctrl)
+                # Acknowledge settings-editor applies so the UI can show what took
+                # effect vs what was ignored or needs a reconnect (LV-F6).
+                if isinstance(ctrl, dict) and ("capture" in ctrl or "source" in ctrl):
+                    await ws.send_text(json.dumps({"message":
+                        f"settings — applied {ack['applied']}; "
+                        f"ignored {ack['ignored']}; reconnect-only {ack['reconnect']}"}))
             except asyncio.TimeoutError:
                 # Keepalive: connection stays open, no data in 15 s is normal
                 pass
