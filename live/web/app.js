@@ -974,29 +974,10 @@ function applyAnalysisMode() {
     updateMeta();
 }
 
-document.getElementById("center-btn").addEventListener("click", () => {
-    const mhz = parseFloat(document.getElementById("center-mhz").value);
-    if (!isNaN(mhz)) sendControl({ center: mhz * 1e6 });
-});
-document.getElementById("center-mhz").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") document.getElementById("center-btn").click();
-});
-
-document.getElementById("rate-sel").addEventListener("change", (e) => {
-    const fs   = parseFloat(e.target.value) * 1e6;
-    const ctrl = { sample_rate: fs };
-    if (replaceMode) ctrl.rows = rowsForWindow(fs, radioNfft, windowMs, backendHopFrac());
-    sendControl(ctrl);
-});
-
-document.getElementById("gain-btn").addEventListener("click", () => {
-    const g = parseFloat(document.getElementById("gain").value);
-    if (!isNaN(g)) sendControl({ gain: g });
-});
-document.getElementById("gain").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") document.getElementById("gain-btn").click();
-});
-
+// Center / span (sample_rate) / gain are set from the schema Capture Settings
+// form now (they map to live radio params in SharedConfig.update) — the old
+// "Radio (AIR-T)" bar and its handlers were removed in P1-3. FFT keeps a home
+// as a static select in the Capture panel, wired below.
 document.getElementById("nfft-sel").addEventListener("change", (e) => {
     const nfft = parseInt(e.target.value, 10);
     radioNfft = nfft;   // the ONLY place radioNfft is updated
@@ -1005,19 +986,9 @@ document.getElementById("nfft-sel").addEventListener("change", (e) => {
     sendControl(ctrl);
 });
 
-document.getElementById("tune-btn").addEventListener("click", () => {
-    if (bandLo === null || bandHi === null) return;
-    if (!absRF) {
-        logMsg("Tune to band needs Absolute RF enabled", "WARN");   // LV-R9c
-        return;
-    }
-    const lo = Math.min(bandLo, bandHi);
-    const hi = Math.max(bandLo, bandHi);
-    const newCenter = ((lo + hi) / 2) * 1e6;
-    document.getElementById("center-mhz").value = (newCenter / 1e6).toFixed(3);
-    sendControl({ center: newCenter });
-    logMsg(`Tuned to selection center: ${(newCenter / 1e6).toFixed(3)} MHz`);
-});
+// (P1-3) "Tune to band" was removed with the Radio bar. The PSD band-drag
+// selection stays — it still drives the band monitor; only the tune action is
+// gone.
 
 const pauseBtn = document.getElementById("pause-btn");
 pauseBtn.addEventListener("click", () => {

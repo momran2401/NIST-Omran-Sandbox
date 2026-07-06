@@ -42,45 +42,6 @@
 <!-- ── Controls ──────────────────────────────────────────────────────────── -->
 <div id="controls">
 
-    <div class="ctrl-group pro-only" id="radio-ctrl">
-        <span class="group-label">Radio (AIR-T)</span>
-
-        <div class="field-row">
-            <label>Center (MHz)
-                <input type="number" id="center-mhz" step="0.5" min="300" max="6000" value="1955">
-            </label>
-            <button id="center-btn">Apply</button>
-        </div>
-
-        <label>Span (MS/s)
-            <select id="rate-sel">
-                <option value="3.84">3.84</option>
-                <option value="7.68">7.68</option>
-                <option value="15.36" selected>15.36</option>
-                <option value="30.72">30.72</option>
-            </select>
-        </label>
-
-        <div class="field-row">
-            <label>Gain (dB)
-                <input type="number" id="gain" step="0.5" min="-60" max="10" value="0" title="AIR-T RX gain">
-            </label>
-            <button id="gain-btn">Apply</button>
-        </div>
-
-        <label>FFT
-            <select id="nfft-sel">
-                <option value="256">256</option>
-                <option value="512">512</option>
-                <option value="1024" selected>1024</option>
-                <option value="2048">2048</option>
-                <option value="4096">4096</option>
-            </select>
-        </label>
-
-        <button id="tune-btn">Tune to band</button>
-    </div>
-
     <div class="ctrl-group" id="disp-ctrl">
         <span class="group-label">Display</span>
 
@@ -167,6 +128,21 @@
     <div id="settings-editor">
         <div class="settings-col">
             <h3>Capture</h3>
+            <!-- FFT size is a spectrogram control, not a SoapyCapture field, so it
+                 lives here as a static control (outside the schema-rendered form,
+                 which is cleared on every reload). Sends {nfft} — snapped +
+                 validated server-side. Former home was the deleted Radio bar. -->
+            <div class="settings-grid settings-static">
+                <label>FFT size
+                    <select id="nfft-sel">
+                        <option value="256">256</option>
+                        <option value="512">512</option>
+                        <option value="1024" selected>1024</option>
+                        <option value="2048">2048</option>
+                        <option value="4096">4096</option>
+                    </select>
+                </label>
+            </div>
             <div id="capture-settings-form" class="settings-grid"></div>
         </div>
         <div class="settings-col">

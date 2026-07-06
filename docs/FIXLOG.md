@@ -401,3 +401,23 @@ error in the server log, not a crash — `compute_blocks` is wrapped).
 the `applied` ack lists `analysis_bandwidth/lo_shift/host_resample/backend_sample_rate`, `ignored`
 no longer lists them, and no error occurs (a local `SharedConfig.update` check confirms valid
 values are applied and `lo_shift="sideways"` / `analysis_bandwidth=-3` are rejected).
+
+### P1-3 — Delete the "Radio (AIR-T)" bar; move FFT into the Capture panel
+**Files:** `live/web/index.html`, `live/web/app.js`
+**Changed:** Removed the entire `#radio-ctrl` control group (`center-mhz`+`center-btn`,
+`rate-sel`, `gain`+`gain-btn`, `nfft-sel`, `tune-btn`) and its now-dead handlers in `app.js`
+(center apply/Enter, rate-sel, gain apply/Enter, tune-btn). Center / span (sample_rate) / gain are
+already settable from the schema Capture Settings form (they map to live params in
+`SharedConfig.update`), so they need no new home. **FFT** got a new home: a static `FFT size`
+`<select>` (256/512/1024/2048/4096) in the DAN-mode Capture panel (`#settings-panel`, `pro-only`),
+placed outside the schema-rendered form (which is cleared on reload) so it isn't wiped. It keeps
+the id `#nfft-sel`, so the existing change handler — the sole updater of `radioNfft`, sending
+`{nfft}` (server snaps+validates) — is retained. **"Tune to band" is gone** in Phase 1; the PSD
+band-drag selection stays (still drives the band monitor). The NOOB station tuner's
+`getElementById("center-mhz")` is already guarded by `if (input)` and tunes via
+`sendControl({center})` directly, so it is unaffected by the input's removal.
+
+**Verify [demo]:** the top Radio bar is gone; setting center/rate/gain from the Capture form and
+FFT from the new select retunes the radio (the `applied` ack lists them; waterfall/labels update).
+Confirmed structurally: served HTML has no `radio-ctrl`/`tune-btn`; `#nfft-sel` lives in
+`.settings-static`; a WS `{nfft:2048}` yields frames with `nfft=2048`.
