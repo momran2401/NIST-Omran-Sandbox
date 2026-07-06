@@ -279,3 +279,14 @@ test; `nBins = hiIdx-loIdx+1`. Output strings unchanged.
 
 **Verify [demo]:** switch to Quicklook at FFT 4096 with a 300-row window and drag the band — the
 page stays at full fps (`performance.now()` delta around the call < 5 ms).
+
+### LV-R7 — Cool-mode scroll: fix within-block row order
+**File:** `live/web/app.js`
+**Changed:** The scroll branch of `updateWaterfall` prepended each new block unchanged, but the
+block is oldest-first while row 0 of a downward-scrolling waterfall must be the newest row — so
+each 12-row band was internally time-reversed (zigzag on bursty signals). Now the block is written
+reversed into the front (`buf.set(block.subarray((newRows-1-r)*nfft, (newRows-r)*nfft), r*nfft)`),
+making time continuous across band boundaries.
+
+**Verify [demo]:** in Cool Mode, temporarily modulate a demo tone on/off in `DemoAcquirer` — pulse
+stripes must form continuous diagonals across frame boundaries, not a sawtooth; revert the edit.

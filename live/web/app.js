@@ -362,11 +362,16 @@ function updateWaterfall(ch, block, rows, nfft, center, fs) {
         buf.fill(-150);
         buf.set(block.subarray(0, Math.min(bLen, size)));
     } else {
-        // Scroll mode: shift existing rows down, prepend new rows at [0]
+        // Scroll mode: shift existing rows down, prepend new rows at [0].
         const newRows = Math.min(bLen / nfft, depth);
         const keep    = (depth - newRows) * nfft;
         if (keep > 0) buf.copyWithin(newRows * nfft, 0, keep);
-        buf.set(block.subarray(0, newRows * nfft));
+        // Write the block's rows reversed: the block is oldest-first, but row 0 of a
+        // downward-scrolling waterfall must be the newest row — otherwise each frame
+        // band is internally time-reversed (zigzag on bursty signals) — LV-R7.
+        for (let r = 0; r < newRows; r++) {
+            buf.set(block.subarray((newRows - 1 - r) * nfft, (newRows - r) * nfft), r * nfft);
+        }
     }
 
     // ── Auto color levels (5th / 99th percentile of a subsample) ──────────
