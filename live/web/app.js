@@ -903,7 +903,11 @@ function rowsForCurrentSettings() {
 function applyAnalysisMode() {
     document.body.classList.toggle("analysis-psd", analysisMode === "psd");
     document.body.classList.toggle("analysis-ssb", analysisMode === "ssb");
-    const backend = analysisMode === "ssb" ? "ssb" : "calibrated";
+    // "PSD view" is a client-only waterfall-hide toggle (backend stays calibrated);
+    // Quicklook selects the raw per-bin FFT backend the server already supports.
+    const backend = analysisMode === "ssb" ? "ssb"
+                  : analysisMode === "quicklook" ? "quicklook"
+                  : "calibrated";
     wfBuf[0] = wfBuf[1] = null;
     holdBuf[0] = holdBuf[1] = null;
     minBuf[0] = minBuf[1] = null;

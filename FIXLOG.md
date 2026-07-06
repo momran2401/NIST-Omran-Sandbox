@@ -132,3 +132,14 @@ caption uses the real FFT size and the true hop-aware window ms.
 
 **Verify [demo]:** switch backends in `--demo` and confirm the label changes and the ~8.5 dB
 level shift is now explained on-screen; export CSV and check the header comment lines.
+
+### LV-F5 — Expose Quicklook in the Analysis dropdown; rename PSD → "PSD view"
+**Files:** `live/web/index.html`, `live/web/app.js`
+**Changed:** Added `<option value="quicklook">Quicklook (raw FFT)</option>` to `#analysis-sel`
+and extended `applyAnalysisMode` to send `{backend:"quicklook"}` for it (server already supports
+quicklook via `BACKENDS`). Renamed the "PSD" option to "PSD view" (it only hides waterfalls; the
+backend stays calibrated). Did **not** implement the striqt `power_spectral_density` backend this
+pass (per the finding).
+
+**Verify [demo]:** selecting Quicklook changes `header.backend` to `"quicklook"`, the DC spike
+appears (no LO null), and levels drop ~8–9 dB (per-bin vs band-integrated — now labeled by LV-F4).
