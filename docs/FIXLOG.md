@@ -752,3 +752,47 @@ switching back to Spectrogram resumes 569-row calibrated frames (hop 540). In th
 PSD mode shows one legend entry per statistic and clicking an entry hides that trace.
 **Verify [hardware]:** percentile traces over a real bursty band order sensibly and change
 when the statistic list is edited from the Analysis panel.
+
+### P2b-5 — Honest SSB: full param block + capture-rate retune (server)
+**Files:** `live/striqt_web_server.py`, `live/web/app.js`
+**Changed:** The SSB backend's hardcoded recipe becomes a validated `RadioConfig` block
+(`ssb_subcarrier_spacing`, `ssb_sample_rate`, `ssb_discovery_periodicity`,
+`ssb_frequency_offset`, `ssb_max_block_count`, `ssb_window`, `ssb_lo_bandstop`; defaults are
+the old hardcodes) behind a new `"ssb"` `ANALYSIS_TARGETS` entry. **The audit's honesty item is
+fixed by retuning:** `ssb_grid_compatible` is generalized (2·fs/scs must be an integer
+28-multiple ⇔ fs a multiple of 14·scs) and, whenever a message leaves the SSB backend at an
+incompatible rate (selecting SSB, changing SCS, or picking an off-grid rate), `update()`
+retunes the capture rate to `ssb_compatible_rate()` — the nearest 14·scs multiple, preferring
+the radio's 1.92 MHz LTE family (13.44 MS/s for all standard SCS) — and reports it in the ack's
+`rounded` list; `ws_endpoint` now acks ANY message the freedom model adjusted, so even a bare
+`{"backend":"ssb"}` surfaces the retune. If a rate is still off-grid (retune impossible),
+`compute_blocks` keeps the existing explicit calibrated substitution via
+`backend`/`backend_requested`; the old **silent** in-function fallback (which mislabeled
+calibrated output as executed-SSB) is removed — no phantom SSB. `ssb_spectrogram` is rewritten
+on an exact geometry (`ssb_geometry`: nfft = 2fs/scs, hop = one OFDM symbol, 28·scs/15e3
+symbol rows per burst — always 2 ms; `ssb_block_samples`/`ssb_max_blocks`): frames carry whole
+burst sets only (striqt's blockwise reshape requires it), rows = bursts × symbol_rows,
+disclosed as `fft_nfft` = nfft, `bin_avg` = 2 (scs-wide integrated bins), `hop_size` = one
+symbol; exact striqt frequency coords come from the `cellular_ssb_baseband_frequency` factory
+(private-module import with symmetric-axis fallback — **vendored/installed divergence risk
+flagged**). `row_hop`/`max_live_rows`/`samples_needed` gain burst-aware SSB branches so
+Duration picks the burst count (20 ms → 1 burst, 40 ms → 2). Tier-1 rules (all snap & tell):
+scs bounded so 14·scs ≤ 30.72 MS/s; SSB output rate ≤ sampled span; discovery ≥ one 2 ms burst
+and ≤ ring; frequency_offset a multiple of scs AND |offset| + ssb_rate/2 ≤ fs/2 (both
+constraints confirmed against striqt's own errors); max_block_count whole or none. Tier 2:
+`scratch_validate_ssb` runs the real measurement on a one-burst buffer at the rate the retune
+would arm. The display-side LO null is skipped at nonzero offsets (DC is no longer at the band
+center; striqt's own lo_bandstop covers it). Client: the SSB dropdown option is no longer
+disabled by a client-side grid guess — the server retunes and reports instead.
+**[hardware] risk flag:** the retune arms 13.44 MS/s (7×1.92 MHz) — an LTE-family but
+non-default rate; confirm the AIR8201B accepts it during the hardware window.
+
+**Verify [demo]:** on a demo boot, `{"backend":"ssb"}` at 15.36 MS/s acks
+`rounded sample_rate: 15.36e6 → 13.44e6 (…symbol grid…)` and streams TRUE SSB frames
+(rows 56, bins 256, fft_nfft 896, bin_avg 2, hop 480, no backend_requested mismatch);
+duration 40 ms yields 112 rows (2 bursts); live SCS 15 kHz reshapes to rows 28/bins 512/hop
+960 with no retune (13.44 is a 210 kHz multiple); offset 2 MHz snaps to 2.01 MHz and computes;
+99 MHz clamps to the span-fitting ±2.88 MHz; `notawindow` rejected with striqt's reason;
+max_block_count caps the frame. **Verify [hardware]:** the radio arms 13.44 MS/s; with a live
+n41 SSB the burst view shows the 4-column SSB symbol structure; discovery 20 ms lines bursts
+up frame-to-frame; deliberately-bad params report and never kill the feed.

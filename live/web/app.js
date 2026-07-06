@@ -195,21 +195,15 @@ function sendTimeControl() {
     else             sendControl({ rows: 12 });
 }
 
-// Mirror of the server's ssb_grid_compatible: the true SSB path needs the sample
-// rate on a 420 kHz grid (13·nfft divisible by 28, nfft = round(2·fs/30 kHz)).
-function ssbGridCompatible(fs) {
-    const nfft = Math.round(2 * fs / 30e3);
-    return nfft > 0 && (13 * nfft) % 28 === 0;
-}
-
-// Disable the SSB analysis option when the current rate can't deliver it, so the
-// UI never offers what the stack silently falls back from (LV-F2).
+// SSB is always selectable now (P2b-5): when the current rate is off the SSB
+// symbol grid, the SERVER retunes the capture rate to the nearest compatible
+// one and reports the change through the settings ack (handleAck shows it) —
+// no silent fallback, no disabled option guessing at the server's grid.
 function updateSsbOption() {
     const opt = document.querySelector('#analysis-sel option[value="ssb"]');
     if (!opt) return;
-    const ok = ssbGridCompatible(curFs);
-    opt.disabled = !ok;
-    opt.title = ok ? "" : "SSB needs a sample rate on the 420 kHz grid — none of the LTE rates qualify";
+    opt.disabled = false;
+    opt.title = "May retune the capture sample rate onto the SSB symbol grid (reported in the log)";
 }
 
 // ---------------------------------------------------------------------------

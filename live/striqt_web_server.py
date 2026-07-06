@@ -176,6 +176,11 @@ SSB_SUBCARRIER_SPACING = 30e3
 SSB_SAMPLE_RATE = 7.68e6
 SSB_DISCOVERY_PERIOD = 20e-3
 SSB_LO_BANDSTOP = 120e3
+SSB_WINDOW = "blackmanharris"
+# Ceiling for SSB-grid capture retunes (P2b-5): the top of the radio's LTE-rate
+# family. The grid rule (2·fs/scs a 28-multiple) admits no rate above this that
+# we would trust the AIR8201B to arm.
+SSB_MAX_RATE = 30.72e6
 
 # Default striqt Spectrogram recipe — the exact values calibrated_spectrogram
 # hardcoded before P2a-1. These seed the editable analysis params in RadioConfig,
@@ -486,6 +491,24 @@ ANALYSIS_TARGETS = {
                   "psd_window_fill", "psd_integration_bandwidth",
                   "psd_lo_bandstop", "psd_trim_stopband", "psd_time_statistic"),
     },
+    # striqt cellular_5g_ssb_spectrogram (P2b-5): the symbol-aligned SSB burst
+    # view. subcarrier_spacing goes first — it defines the grid every other
+    # field (and the capture sample-rate retune) is judged against.
+    "ssb": {
+        "fields": {
+            "subcarrier_spacing":    "ssb_subcarrier_spacing",
+            "sample_rate":           "ssb_sample_rate",
+            "discovery_periodicity": "ssb_discovery_periodicity",
+            "frequency_offset":      "ssb_frequency_offset",
+            "max_block_count":       "ssb_max_block_count",
+            "window":                "ssb_window",
+            "lo_bandstop":           "ssb_lo_bandstop",
+        },
+        "virtual": (),
+        "order": ("ssb_subcarrier_spacing", "ssb_sample_rate",
+                  "ssb_discovery_periodicity", "ssb_frequency_offset",
+                  "ssb_max_block_count", "ssb_window", "ssb_lo_bandstop"),
+    },
 }
 
 # RadioConfig fields that are only settable through the validated "analysis"
@@ -514,6 +537,13 @@ ANALYSIS_DEFAULTS = {
     "psd_lo_bandstop":           DEFAULT_LO_BANDSTOP,
     "psd_trim_stopband":         DEFAULT_TRIM_STOPBAND,
     "psd_time_statistic":        DEFAULT_PSD_TIME_STATISTIC,
+    "ssb_subcarrier_spacing":    SSB_SUBCARRIER_SPACING,
+    "ssb_sample_rate":           SSB_SAMPLE_RATE,
+    "ssb_discovery_periodicity": SSB_DISCOVERY_PERIOD,
+    "ssb_frequency_offset":      0.0,
+    "ssb_max_block_count":       None,
+    "ssb_window":                SSB_WINDOW,
+    "ssb_lo_bandstop":           SSB_LO_BANDSTOP,
 }
 
 
@@ -707,12 +737,45 @@ def scratch_validate_psd(cfg: "RadioConfig"):
     return None
 
 
+def scratch_validate_ssb(cfg: "RadioConfig"):
+    """
+    Tier-2 judge for the SSB target (P2b-5): run striqt's real
+    cellular_5g_ssb_spectrogram on a one-burst-set synthetic buffer with the
+    exact kwargs the live compute would use. cfg.sample_rate must already be
+    on the SSB grid for cfg's subcarrier spacing (the tier-1 branch retunes
+    the effective rate before probing). Returns the striqt error text when a
+    param combination is illegal, or None when it is safe to go live.
+    """
+    if not _ANALYSIS_OK:
+        return None
+    try:
+        sample_rate = float(cfg.sample_rate)
+        geo = ssb_geometry(cfg)   # off-grid raises → worded rejection
+        needed = ssb_block_samples(geo, 1)
+        kwargs = make_ssb_kwargs(cfg)
+        capture = analysis_specs.Capture(
+            sample_rate=sample_rate,
+            duration=needed / sample_rate,
+            analysis_bandwidth=float("inf"),
+        )
+        tiny = np.zeros((1, needed), dtype=np.complex64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            striqt_measurements.cellular_5g_ssb_spectrogram(
+                tiny, capture, as_xarray=False, **kwargs
+            )
+    except Exception as e:
+        return str(e).strip() or type(e).__name__
+    return None
+
+
 # Tier-2 scratch validators, one per analysis target (P2b-1). Each judges a
 # proposed RadioConfig by running the target's real striqt pipeline on a tiny
 # synthetic buffer — never the live ring.
 SCRATCH_VALIDATORS = {
     "spectrogram": scratch_validate_spectrogram,
     "psd":         scratch_validate_psd,
+    "ssb":         scratch_validate_ssb,
 }
 
 
@@ -777,6 +840,21 @@ class RadioConfig:
     psd_lo_bandstop:           object = DEFAULT_LO_BANDSTOP
     psd_trim_stopband:         bool   = DEFAULT_TRIM_STOPBAND
     psd_time_statistic:        tuple  = DEFAULT_PSD_TIME_STATISTIC
+    # striqt Cellular5GNRSSBSpectrogram analysis params (P2b-5) — defaults are
+    # the exact values the SSB path hardcoded before, so behaviour is unchanged
+    # until edited from the Analysis panel.
+    #   ssb_subcarrier_spacing:    3GPP SCS in Hz (15e3/30e3/60e3 …)
+    #   ssb_sample_rate:           output rate of the recentered SSB band (S/s)
+    #   ssb_discovery_periodicity: time between synchronization bursts (s)
+    #   ssb_frequency_offset:      SSB center offset from the capture center (Hz)
+    #   ssb_max_block_count:       None, or a cap on bursts evaluated per frame
+    ssb_subcarrier_spacing:    float  = SSB_SUBCARRIER_SPACING
+    ssb_sample_rate:           float  = SSB_SAMPLE_RATE
+    ssb_discovery_periodicity: float  = SSB_DISCOVERY_PERIOD
+    ssb_frequency_offset:      float  = 0.0
+    ssb_max_block_count:       object = None
+    ssb_window:                object = SSB_WINDOW
+    ssb_lo_bandstop:           object = SSB_LO_BANDSTOP
 
     def snapshot(self):
         return RadioConfig(
@@ -806,6 +884,13 @@ class RadioConfig:
             psd_lo_bandstop=self.psd_lo_bandstop,
             psd_trim_stopband=bool(self.psd_trim_stopband),
             psd_time_statistic=tuple(self.psd_time_statistic),
+            ssb_subcarrier_spacing=float(self.ssb_subcarrier_spacing),
+            ssb_sample_rate=float(self.ssb_sample_rate),
+            ssb_discovery_periodicity=float(self.ssb_discovery_periodicity),
+            ssb_frequency_offset=float(self.ssb_frequency_offset),
+            ssb_max_block_count=self.ssb_max_block_count,
+            ssb_window=self.ssb_window,
+            ssb_lo_bandstop=self.ssb_lo_bandstop,
         )
 
 
@@ -1171,7 +1256,166 @@ class SharedConfig:
                     rejected.append({"field": "psd.time_statistic",
                                      "requested": requested, "reason": str(e)})
             return accepted, ack_field, requested_map
+        if target == "ssb":
+            return self._tier1_ssb(req, eff, rounded, rejected)
         raise RuntimeError(f"no tier-1 validator for analysis target {target!r}")
+
+    def _tier1_ssb(self, req, eff, rounded, rejected):
+        """
+        Tier-1 snap rules for the SSB target (P2b-5). Knowable constraints:
+        the subcarrier spacing must admit a compatible capture rate (14·scs ≤
+        SSB_MAX_RATE); the output rate can't exceed the sampled span; the
+        discovery periodicity must cover at least one burst set (2 ms of
+        symbols for every SCS) and one period must fit the IQ ring; the
+        frequency offset must stay inside the sampled span; max_block_count is
+        a whole number of burst sets or none. Everything subtler goes to the
+        tier-2 scratch run. eff.sample_rate is moved onto the SSB grid the
+        retune would pick, so the probes judge the config that would go live.
+        """
+        accepted, ack_field, requested_map = {}, {}, {}
+
+        def tell(field, requested, used, reason):
+            rounded.append({"field": "ssb." + field, "requested": requested,
+                            "used": used, "reason": reason})
+
+        def reject(field, requested, reason):
+            rejected.append({"field": "ssb." + field,
+                             "requested": requested, "reason": reason})
+
+        def take(field, cfg_key, value):
+            accepted[cfg_key] = value
+            ack_field[cfg_key] = "ssb." + field
+            requested_map[cfg_key] = req.get(field)
+
+        if req.get("subcarrier_spacing") is not None:
+            requested = req["subcarrier_spacing"]
+            try:
+                v = float(requested)
+                if not (v > 0 and math.isfinite(v)):
+                    raise ValueError("subcarrier spacing must be a positive, finite Hz value")
+                snapped = min(max(v, 1e3), SSB_MAX_RATE / 14.0)
+                if snapped != v:
+                    tell("subcarrier_spacing", v, snapped,
+                         f"the compatible capture rate 14·scs must stay within "
+                         f"{SSB_MAX_RATE / 1e6:g} MS/s, and scs ≥ 1 kHz keeps the "
+                         f"live FFT tractable")
+                take("subcarrier_spacing", "ssb_subcarrier_spacing", float(snapped))
+            except (TypeError, ValueError) as e:
+                reject("subcarrier_spacing", requested, str(e))
+
+        scs_eff = float(accepted.get("ssb_subcarrier_spacing",
+                                     eff.ssb_subcarrier_spacing))
+
+        # Probe at the capture rate the SSB retune would arm (update() commits
+        # the real retune and reports it), so tier-2 judges the true config.
+        if not ssb_grid_compatible(eff.sample_rate, scs_eff):
+            compatible = ssb_compatible_rate(eff.sample_rate, scs_eff)
+            if compatible:
+                eff.sample_rate = float(compatible)
+
+        if req.get("sample_rate") is not None:
+            requested = req["sample_rate"]
+            try:
+                v = float(requested)
+                if not (v > 0 and math.isfinite(v)):
+                    raise ValueError("SSB output rate must be a positive, finite S/s value")
+                if v > eff.sample_rate:
+                    tell("sample_rate", v, eff.sample_rate,
+                         "the SSB output band cannot exceed the sampled span")
+                    v = float(eff.sample_rate)
+                take("sample_rate", "ssb_sample_rate", float(v))
+            except (TypeError, ValueError) as e:
+                reject("sample_rate", requested, str(e))
+
+        if req.get("discovery_periodicity") is not None:
+            requested = req["discovery_periodicity"]
+            try:
+                v = float(requested)
+                if not (v > 0 and math.isfinite(v)):
+                    raise ValueError("discovery periodicity must be a positive, finite duration in seconds")
+                burst_span = 2e-3   # symbol_rows·hop/fs == 2 ms for every SCS
+                ring_cap = int(MAX_TAIL * RING_ROW_FILL) / eff.sample_rate
+                snapped = min(max(v, burst_span), ring_cap)
+                if snapped != v:
+                    tell("discovery_periodicity", v, snapped,
+                         "must cover at least one 2 ms burst set and one period "
+                         "must fit the IQ ring")
+                take("discovery_periodicity", "ssb_discovery_periodicity", float(snapped))
+            except (TypeError, ValueError) as e:
+                reject("discovery_periodicity", requested, str(e))
+
+        if req.get("frequency_offset") is not None:
+            requested = req["frequency_offset"]
+            try:
+                v = float(requested)
+                if not math.isfinite(v):
+                    raise ValueError("frequency offset must be a finite Hz value")
+                # The truncated SSB band must fit the sampled span:
+                # |offset| + ssb_rate/2 ≤ fs/2 (striqt raises otherwise).
+                ssb_rate_eff = min(
+                    float(accepted.get("ssb_sample_rate", eff.ssb_sample_rate)),
+                    float(eff.sample_rate),
+                )
+                half = max(0.0, (eff.sample_rate - ssb_rate_eff) / 2.0)
+                clamped = min(max(v, -half), half)
+                # striqt's truncate_freqs also requires the offset on the
+                # averaged subcarrier grid: a multiple of scs (knowable →
+                # snap & tell; confirmed against the striqt error text).
+                bin_hz = scs_eff
+                snapped = round(clamped / bin_hz) * bin_hz
+                if abs(snapped - v) > 1e-6 * max(abs(v), 1.0):
+                    tell("frequency_offset", v, snapped,
+                         f"must be a multiple of the subcarrier spacing "
+                         f"{bin_hz / 1e3:g} kHz and keep the {ssb_rate_eff / 1e6:g} "
+                         f"MS/s SSB band inside the sampled span")
+                take("frequency_offset", "ssb_frequency_offset", float(snapped))
+            except (TypeError, ValueError) as e:
+                reject("frequency_offset", requested, str(e))
+
+        if "max_block_count" in req and req["max_block_count"] is not None:
+            requested = req["max_block_count"]
+            try:
+                v = requested
+                if isinstance(v, str):
+                    text = v.strip().lower()
+                    v = None if text in ("", "none", "null", "off") else float(text)
+                elif isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise ValueError("max_block_count must be a whole number of burst sets or 'none'")
+                if v is not None:
+                    if not math.isfinite(v) or v <= 0:
+                        v = None
+                    else:
+                        k = max(1, round(v))
+                        if k != v:
+                            tell("max_block_count", v, k,
+                                 "must be a whole number of burst sets")
+                        v = int(k)
+                take("max_block_count", "ssb_max_block_count", v)
+            except (TypeError, ValueError) as e:
+                reject("max_block_count", requested, str(e))
+
+        if req.get("window") is not None:
+            try:
+                take("window", "ssb_window", _parse_window(req["window"]))
+            except ValueError as e:
+                reject("window", req["window"], str(e))
+
+        if "lo_bandstop" in req and req["lo_bandstop"] is not None:
+            requested = req["lo_bandstop"]
+            try:
+                v = _parse_optional_hz(requested)
+                if v is not None:
+                    if v < 0:
+                        raise ValueError("lo_bandstop must be positive or 'none'")
+                    if v > eff.sample_rate:
+                        tell("lo_bandstop", v, eff.sample_rate,
+                             "cannot exceed the sampled span (sample_rate)")
+                        v = float(eff.sample_rate)
+                take("lo_bandstop", "ssb_lo_bandstop", v)
+            except ValueError as e:
+                reject("lo_bandstop", requested, str(e))
+
+        return accepted, ack_field, requested_map
 
     def _tier1_time_aperture(self, req, eff, on_calibrated_grid,
                              accepted, ack_field, requested_map, rounded, rejected):
@@ -1371,6 +1615,29 @@ class SharedConfig:
                 if explicit_rows and "duration" not in changed_keys and self._cfg.duration:
                     changes.append(("duration", self._cfg.duration, 0.0))
                     self._cfg.duration = 0.0
+                # SSB honesty (P2b-5): the symbol-aligned SSB view only exists
+                # on the 14·scs capture grid. When this message leaves the SSB
+                # backend at an incompatible rate (selecting SSB, changing the
+                # SCS, or picking an off-grid rate), retune to the nearest
+                # compatible rate and REPORT it — never a phantom SSB. Runs
+                # before the duration→rows derivation so rows follow the new
+                # rate/geometry.
+                if self._cfg.backend == "ssb" and not ssb_grid_compatible(
+                        self._cfg.sample_rate, self._cfg.ssb_subcarrier_spacing):
+                    new_rate = ssb_compatible_rate(
+                        self._cfg.sample_rate, self._cfg.ssb_subcarrier_spacing
+                    )
+                    if new_rate and new_rate != self._cfg.sample_rate:
+                        rounded.append({
+                            "field": "sample_rate",
+                            "requested": float(self._cfg.sample_rate),
+                            "used": float(new_rate),
+                            "reason": "SSB needs 2·sample_rate/subcarrier_spacing "
+                                      "to be a multiple of 28 (striqt symbol "
+                                      "grid); retuned the capture rate",
+                        })
+                        changes.append(("sample_rate", self._cfg.sample_rate, new_rate))
+                        self._cfg.sample_rate = float(new_rate)
                 if self._cfg.duration > 0:
                     rows_new = int(max(1, min(
                         round(self._cfg.duration * self._cfg.sample_rate / row_hop(self._cfg)),
@@ -1786,55 +2053,80 @@ def psd_traces(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
 
 def ssb_spectrogram(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
     """
-    5G SSB spectrogram path from striqt. The returned SSB block and symbol axes
-    are flattened to the dashboard's existing rows x bins frame contract.
-    Returns (blocks, meta). SSB analysis params stay hardcoded (Phase 2b).
+    True symbol-aligned 5G SSB spectrogram (P2b-5): striqt's
+    cellular_5g_ssb_spectrogram driven by cfg's SSB param block, one row per
+    OFDM symbol of each burst set, flattened (blocks·symbols) to the dashboard
+    row contract. Only reachable on the SSB grid (compute_blocks pre-checks
+    and runs calibrated honestly otherwise); grid errors here propagate to the
+    tier-3 backstop rather than silently substituting another analysis.
+    Returns (blocks, meta).
     """
     if not _ANALYSIS_OK:
         raise RuntimeError(f"SSB backend unavailable: {_ANALYSIS_ERR!r}")
 
     samples = np.asarray(samples, dtype=np.complex64)
-    rows        = int(cfg.rows)
     sample_rate = float(cfg.sample_rate)
+    geo = ssb_geometry(cfg)   # raises off-grid — backstop-visible, never phantom
+
+    # Trim to whole burst sets: striqt keeps the first symbol_rows of every
+    # discovery period, and its blockwise reshape needs the kept row count to
+    # be an exact multiple of symbol_rows.
+    q = 1 + max(0, (samples.shape[1] - ssb_block_samples(geo, 1))
+                // (geo["discovery_rows"] * geo["hop"]))
+    q = min(q, ssb_max_blocks(cfg, geo))
+    needed = ssb_block_samples(geo, q)
+    if samples.shape[1] < needed:
+        pad = np.zeros((samples.shape[0], needed - samples.shape[1]), dtype=np.complex64)
+        samples = np.concatenate([samples, pad], axis=1)
+    else:
+        samples = samples[:, -needed:]
+
     capture = analysis_specs.Capture(
         sample_rate=sample_rate,
-        duration=samples.shape[1] / sample_rate,
+        duration=needed / sample_rate,
         analysis_bandwidth=float("inf"),
     )
-    try:
-        spg, _ = striqt_measurements.cellular_5g_ssb_spectrogram(
-            samples,
-            capture,
-            as_xarray=False,
-            subcarrier_spacing=SSB_SUBCARRIER_SPACING,
-            sample_rate=min(SSB_SAMPLE_RATE, sample_rate),
-            discovery_periodicity=SSB_DISCOVERY_PERIOD,
-            frequency_offset=0.0,
-            max_block_count=None,
-            window="blackmanharris",
-            lo_bandstop=SSB_LO_BANDSTOP,
-        )
-    except ValueError as exc:
-        if "counting-number" not in str(exc):
-            raise
-        # The live viewer's power-of-two sample-rate/FFT controls are not
-        # always compatible with the strict 30 kHz SSB grid. Keep the selector
-        # useful by falling back to the same calibrated averaged grid.
-        return calibrated_spectrogram(samples, cfg)
+    kwargs = make_ssb_kwargs(cfg)
+    spg, _ = striqt_measurements.cellular_5g_ssb_spectrogram(
+        samples, capture, as_xarray=False, **kwargs
+    )
     spg = np.asarray(spg, dtype=np.float32)
     if spg.ndim == 4:
         spg = spg.reshape(spg.shape[0], spg.shape[1] * spg.shape[2], spg.shape[3])
-    # Real SSB uses 15 kHz (subcarrier_spacing/2) resolution; best-effort axis
-    # params (this path is unreachable at the selectable sample rates — LV-F2).
-    ssb_nfft = max(1, round(sample_rate / (SSB_SUBCARRIER_SPACING / 2)))
+
+    # Axis disclosure: the STFT runs nfft = 2·fs/scs at scs/2 resolution and
+    # integrates pairs of bins (integration_bandwidth = scs), so bin_avg = 2.
+    # The display-side LO null assumes DC sits at the band center, which only
+    # holds at zero frequency_offset — striqt's own lo_bandstop (NaN-nulled,
+    # then scrubbed) covers the true LO region in the offset case.
     blocks = fit_display_rows(
-        spg, rows,
-        bin_avg=1, fft_nfft=ssb_nfft, sample_rate=sample_rate,
-        lo_null=cfg.lo_null, lo_bandstop=SSB_LO_BANDSTOP,
+        spg, spg.shape[1],
+        bin_avg=2, fft_nfft=geo["nfft"], sample_rate=sample_rate,
+        lo_null=(cfg.lo_null and not cfg.ssb_frequency_offset),
+        lo_bandstop=cfg.ssb_lo_bandstop,
     )
-    # Best-effort hop: one SSB symbol row spans ~1/subcarrier_spacing of signal.
-    hop = max(1, round(sample_rate / SSB_SUBCARRIER_SPACING))
-    return blocks, {"fft_nfft": int(ssb_nfft), "bin_avg": 1, "hop_size": int(hop)}
+    # One display row = one OFDM symbol (hop samples). Rows across burst-set
+    # boundaries jump a discovery period — the view is a burst montage, so the
+    # hop labels the signal time actually shown.
+    meta = {"fft_nfft": int(geo["nfft"]), "bin_avg": 2, "hop_size": int(geo["hop"])}
+    # Exact striqt frequency coordinates for the truncated, offset SSB band.
+    # The coordinate factory lives in a private module whose path may differ in
+    # the installed striqt build — fall back to the symmetric header axis then.
+    try:
+        from striqt.analysis.measurements import (
+            _cellular_5g_ssb_spectrogram as _ssb_mod,
+        )
+        spec_obj = analysis_specs.Cellular5GNRSSBSpectrogram(**kwargs)
+        freqs = np.asarray(
+            _ssb_mod.cellular_ssb_baseband_frequency(capture, spec_obj),
+            dtype=np.float64,
+        )
+        if freqs.size >= 2:
+            meta["freqs_hz_f0"]   = float(freqs[0])
+            meta["freqs_hz_step"] = float(freqs[1] - freqs[0])
+    except Exception:
+        pass
+    return blocks, meta
 
 
 # Snap the requested FFT size to a smooth multiple of 28 that is ALSO divisible
@@ -1882,7 +2174,13 @@ def backend_overlap(cfg: RadioConfig):
 def row_hop(cfg: RadioConfig) -> int:
     """Samples of signal one display row spans for cfg's backend (P2a-1). For
     the PSD backend a "row" is one STFT row feeding the statistics, so the
-    duration→rows mapping controls the integrated time span (P2b-3)."""
+    duration→rows mapping controls the integrated time span (P2b-3). For the
+    SSB view, symbol_rows display rows come from every discovery period, so
+    the duration→rows mapping picks the burst count (P2b-5)."""
+    if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate,
+                                                    cfg.ssb_subcarrier_spacing):
+        geo = ssb_geometry(cfg)
+        return max(1, round(geo["discovery_rows"] * geo["hop"] / geo["symbol_rows"]))
     if cfg.backend in CALIBRATED_GRID_BACKENDS:
         nfft = aligned_nfft(cfg.nfft)
         return analysis_hop(nfft, backend_overlap(cfg))
@@ -1902,7 +2200,11 @@ def max_live_rows(cfg: RadioConfig) -> int:
     which is expected and left honest — the cap protects the radio, not the fps).
     """
     limit = int(MAX_TAIL * RING_ROW_FILL)
-    if cfg.backend in CALIBRATED_GRID_BACKENDS:
+    if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate,
+                                                    cfg.ssb_subcarrier_spacing):
+        geo = ssb_geometry(cfg)
+        rows = ssb_max_blocks(cfg, geo) * geo["symbol_rows"]
+    elif cfg.backend in CALIBRATED_GRID_BACKENDS:
         nfft = aligned_nfft(cfg.nfft)
         hop  = analysis_hop(nfft, backend_overlap(cfg))
         rows = (limit - (nfft - hop)) // hop
@@ -1959,24 +2261,129 @@ def fit_display_rows(
 
 
 def samples_needed(cfg: RadioConfig) -> int:
+    if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate,
+                                                    cfg.ssb_subcarrier_spacing):
+        # Whole burst sets only (P2b-5): striqt keeps symbol_rows rows per
+        # discovery period and reshapes blockwise, so the supplied span must
+        # end exactly at a burst boundary. cfg.rows (duration-derived at
+        # discovery_periodicity/symbol_rows per row) picks the burst count.
+        geo = ssb_geometry(cfg)
+        q = max(1, round(cfg.rows / geo["symbol_rows"]))
+        q = min(q, ssb_max_blocks(cfg, geo))
+        return ssb_block_samples(geo, q)
     if cfg.backend in CALIBRATED_GRID_BACKENDS:
         # Overlapped STFT: only rows·hop + (nfft-hop) samples are needed to
         # produce cfg.rows display rows (LV-W2), not the full nfft·rows.
         nfft = aligned_nfft(cfg.nfft)
-        base = calibrated_sample_count(
+        return calibrated_sample_count(
             nfft, cfg.rows, analysis_hop(nfft, backend_overlap(cfg))
         )
-    else:
-        base = int(cfg.nfft * cfg.rows)
-    if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate):
-        ssb = int(math.ceil(SSB_DISCOVERY_PERIOD * cfg.sample_rate))
-        return max(base, ssb)
-    return base
+    return int(cfg.nfft * cfg.rows)
 
 
-def ssb_grid_compatible(sample_rate: float) -> bool:
-    nfft = round(2 * float(sample_rate) / SSB_SUBCARRIER_SPACING)
-    return nfft > 0 and (13 * nfft) % 28 == 0
+def ssb_grid_compatible(sample_rate: float,
+                        subcarrier_spacing: float = SSB_SUBCARRIER_SPACING) -> bool:
+    """
+    True when the capture rate supports the symbol-aligned SSB view at this
+    subcarrier spacing: the SSB spectrogram runs at frequency_resolution scs/2
+    with window_fill 15/28, so nfft = 2·fs/scs must be an integer AND a
+    multiple of 28 ((1-15/28)·nfft integrality — the audit's "30 kHz grid").
+    Equivalently: fs must be a multiple of 14·scs.
+    """
+    ratio = 2.0 * float(sample_rate) / float(subcarrier_spacing)
+    nfft = round(ratio)
+    return nfft >= 28 and abs(ratio - nfft) < 1e-6 and nfft % 28 == 0
+
+
+def ssb_compatible_rate(sample_rate: float, subcarrier_spacing: float):
+    """
+    Nearest capture sample rate that satisfies the SSB grid for this
+    subcarrier spacing — the retune target when the SSB view is selected at an
+    incompatible rate (P2b-5). Candidates are multiples of 14·scs, preferring
+    those also on the radio's 1.92 MHz LTE-family grid (most plausibly armable
+    — e.g. 13.44 MS/s = 7·1.92 MHz for all standard SCS), clamped to
+    SSB_MAX_RATE. Returns None when no such rate exists (scs too large).
+    """
+    base = 14.0 * float(subcarrier_spacing)
+    if not (base > 0 and math.isfinite(base)) or base > SSB_MAX_RATE:
+        return None
+    step = base
+    if abs(base - round(base)) < 1e-6:
+        g = math.gcd(int(round(base)), 1920000)
+        lcm = int(round(base)) * (1920000 // g)
+        if lcm <= SSB_MAX_RATE:
+            step = float(lcm)
+    k = max(1, round(float(sample_rate) / step))
+    while k > 1 and k * step > SSB_MAX_RATE:
+        k -= 1
+    rate = k * step
+    return float(rate) if rate <= SSB_MAX_RATE else None
+
+
+def make_ssb_kwargs(cfg: "RadioConfig") -> dict:
+    """Keyword arguments for striqt's cellular_5g_ssb_spectrogram from cfg's
+    SSB param block (P2b-5) — shared by the live compute and the tier-2
+    scratch validator."""
+    return dict(
+        subcarrier_spacing=float(cfg.ssb_subcarrier_spacing),
+        # striqt truncates the frequency axis to this output rate; it can never
+        # exceed the sampled span.
+        sample_rate=min(float(cfg.ssb_sample_rate), float(cfg.sample_rate)),
+        discovery_periodicity=float(cfg.ssb_discovery_periodicity),
+        frequency_offset=float(cfg.ssb_frequency_offset),
+        max_block_count=(int(cfg.ssb_max_block_count)
+                         if cfg.ssb_max_block_count else None),
+        window=cfg.ssb_window,
+        lo_bandstop=(float(cfg.ssb_lo_bandstop) if cfg.ssb_lo_bandstop else None),
+    )
+
+
+def ssb_geometry(cfg: "RadioConfig", sample_rate=None) -> dict:
+    """
+    Row/sample geometry of the symbol-aligned SSB spectrogram (P2b-5). striqt
+    runs the STFT at frequency_resolution scs/2 with a 13/28 overlap, making
+    one row per OFDM symbol; each discovery period contributes the first
+    `symbol_rows` symbols (one burst set, always 2 ms of signal).
+      nfft:           STFT size 2·fs/scs
+      hop:            samples per symbol row (nfft·15/28)
+      symbol_rows:    rows kept per burst set (28·scs/15e3)
+      discovery_rows: rows spanning one discovery period
+    Raises ValueError when the rate/scs combination is off the grid.
+    """
+    fs  = float(sample_rate if sample_rate is not None else cfg.sample_rate)
+    scs = float(cfg.ssb_subcarrier_spacing)
+    if not ssb_grid_compatible(fs, scs):
+        raise ValueError(
+            f"sample rate {fs/1e6:g} MS/s is not on the SSB grid for "
+            f"subcarrier spacing {scs/1e3:g} kHz (2·fs/scs must be a 28-multiple)"
+        )
+    nfft = round(2.0 * fs / scs)
+    hop  = (nfft * 15) // 28
+    symbol_rows = max(1, round(28.0 * scs / 15e3))
+    discovery_rows = max(symbol_rows,
+                         round(float(cfg.ssb_discovery_periodicity) * fs / hop))
+    return {"nfft": nfft, "hop": hop,
+            "symbol_rows": symbol_rows, "discovery_rows": discovery_rows}
+
+
+def ssb_block_samples(geo: dict, blocks: int) -> int:
+    """Samples that yield exactly `blocks` complete burst sets: (q-1) full
+    discovery periods plus the final burst's symbol rows, plus STFT tail."""
+    q = max(1, int(blocks))
+    return int((q - 1) * geo["discovery_rows"] * geo["hop"]
+               + geo["symbol_rows"] * geo["hop"]
+               + (geo["nfft"] - geo["hop"]))
+
+
+def ssb_max_blocks(cfg: "RadioConfig", geo: dict) -> int:
+    """Most burst sets one frame can hold: bounded by the ring (same
+    RING_ROW_FILL budget as max_live_rows) and cfg.ssb_max_block_count."""
+    limit = int(MAX_TAIL * RING_ROW_FILL)
+    per_extra = geo["discovery_rows"] * geo["hop"]
+    q = 1 + max(0, (limit - ssb_block_samples(geo, 1)) // max(1, per_extra))
+    if cfg.ssb_max_block_count:
+        q = min(q, max(1, int(cfg.ssb_max_block_count)))
+    return int(max(1, q))
 
 
 def compute_blocks(samples: np.ndarray, cfg: RadioConfig):
@@ -1987,10 +2394,12 @@ def compute_blocks(samples: np.ndarray, cfg: RadioConfig):
     used by build_header to ship an honest frame header (LV-F1/F2).
     """
     requested = cfg.backend
-    if requested == "ssb" and not ssb_grid_compatible(cfg.sample_rate):
-        # SSB requires a sample rate on the 420 kHz grid; none of the selectable
-        # rates qualify, so skip the striqt call (which would raise and fall back
-        # every frame) and run calibrated directly, reporting it honestly (LV-F2).
+    if requested == "ssb" and not ssb_grid_compatible(cfg.sample_rate,
+                                                      cfg.ssb_subcarrier_spacing):
+        # SSB needs the capture rate on the 14·scs grid. Selecting SSB retunes
+        # to a compatible rate (P2b-5), so this only covers the transient (or a
+        # rate the retune could not reach): run calibrated and REPORT it via
+        # backend/backend_requested — never a phantom SSB view (LV-F2).
         blocks, meta = calibrated_spectrogram(samples, cfg)
         executed = "calibrated"
     elif requested == "calibrated":
@@ -2647,6 +3056,19 @@ def current_config():
             "time_statistic":        [s if isinstance(s, str) else float(s)
                                       for s in cfg.psd_time_statistic],
         },
+        "analysis_ssb": {
+            "subcarrier_spacing":    float(cfg.ssb_subcarrier_spacing),
+            "sample_rate":           float(cfg.ssb_sample_rate),
+            "discovery_periodicity": float(cfg.ssb_discovery_periodicity),
+            "frequency_offset":      float(cfg.ssb_frequency_offset),
+            "max_block_count":       (int(cfg.ssb_max_block_count)
+                                      if cfg.ssb_max_block_count else None),
+            "window":                (list(cfg.ssb_window)
+                                      if isinstance(cfg.ssb_window, tuple)
+                                      else cfg.ssb_window),
+            "lo_bandstop":           (float(cfg.ssb_lo_bandstop)
+                                      if cfg.ssb_lo_bandstop else None),
+        },
         "backend": str(cfg.backend),
         "rows":    int(cfg.rows),
         "lo_null": bool(cfg.lo_null),
@@ -2782,8 +3204,12 @@ async def ws_endpoint(ws: WebSocket):
                 # took effect vs what was rounded, rejected, ignored, or needs a
                 # reconnect (LV-F6, P2a-2). The structured ack rides along so
                 # app.js can surface rounded/rejected in the status line.
+                # Also ack any message the freedom model adjusted (rounded/
+                # rejected) — e.g. a bare {"backend":"ssb"} that retuned the
+                # sample rate (P2b-5) must be reported, not just applied.
                 if isinstance(ctrl, dict) and (
                     "capture" in ctrl or "source" in ctrl or "analysis" in ctrl
+                    or ack.get("rounded") or ack.get("rejected")
                 ):
                     parts = [f"applied {ack['applied']}"]
                     for r in ack.get("rounded", []):
