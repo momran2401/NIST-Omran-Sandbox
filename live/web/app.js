@@ -33,6 +33,8 @@ let showMin     = false;
 let psdYspan    = null;     // null = auto; number = fixed dB span
 let windowMs    = 20;
 let analysisMode = "spectrogram";
+let maxFps      = 15;       // client-side render-rate cap (LV-U1a)
+let lastRender  = 0;        // performance.now() of the last rendered frame
 
 // Current frame metadata (updated on each frame)
 let curCenter   = 1955e6;
@@ -240,6 +242,13 @@ function onFrame(data) {
     const hdrLen  = dv.getUint32(0, /*littleEndian=*/true);
     const hdrText = new TextDecoder().decode(new Uint8Array(data, 4, hdrLen));
     const header  = JSON.parse(hdrText);
+
+    // Throttle to Max fps: skip the block parse + render for frames arriving faster
+    // than 1000/maxFps. The header is already parsed; meta fps reflects the actual
+    // render rate since the fps counter runs only on rendered frames (LV-U1a).
+    const nowRender = performance.now();
+    if (nowRender - lastRender < 1000 / maxFps) return;
+    lastRender = nowRender;
 
     const { nfft, rows, channels, center, fs, gain, dtype, scale, backend,
             backend_requested, freqs_hz_f0, freqs_hz_step, fft_nfft, bin_avg } = header;
@@ -622,24 +631,29 @@ function updatePSD(channels, blocks, rows, nfft) {
     ];
     vis.forEach((v, i) => { if (i > 0) uplot.setSeries(i, { show: v }); });
 
-    // Peak marker (strongest bin of RX1 max)
-    if (peakMarker && s1x && !showDiff) {
-        drawPeakMarker(s1x, freqArr);
+    // Peak markers (strongest bin per visible channel) — LV-U1b
+    if (peakMarker && !showDiff) {
+        drawPeakMarker(s1x, s2x, freqArr);
     }
 
     // Fixed Y-span
     applyYspan();
 }
 
-// Peak marker: drawn each frame via uPlot's redraw hook
+// Peak markers: computed here, drawn each frame via uPlot's redraw hook. One per
+// channel (RX1/RX2 max traces), so the label is no longer RX1-only (LV-U1b).
 let peakMarkerData = null;
-function drawPeakMarker(s1x, freqArr) {
-    if (!s1x) { peakMarkerData = null; return; }
+function bestBin(arr, freqArr) {
+    if (!arr) return null;
     let bestI = 0;
-    for (let i = 1; i < s1x.length; i++) {
-        if (s1x[i] > s1x[bestI]) bestI = i;
+    for (let i = 1; i < arr.length; i++) {
+        if (arr[i] !== null && (arr[bestI] === null || arr[i] > arr[bestI])) bestI = i;
     }
-    peakMarkerData = { freq: freqArr[bestI], power: s1x[bestI] };
+    const v = arr[bestI];
+    return (v === null || v === undefined) ? null : { freq: freqArr[bestI], power: v };
+}
+function drawPeakMarker(s1x, s2x, freqArr) {
+    peakMarkerData = { rx1: bestBin(s1x, freqArr), rx2: bestBin(s2x, freqArr) };
 }
 
 // uPlot draw hook — overlays: peak marker, band selection
@@ -647,23 +661,26 @@ function drawPsdOverlays(u) {
     const ctx = u.ctx;
     ctx.save();
 
-    // ── Peak marker ──────────────────────────────────────────────────────
+    // ── Peak markers (one per visible channel) ────────────────────────────
     if (peakMarker && peakMarkerData && !showDiff) {
-        const { freq, power } = peakMarkerData;
-        const px = u.valToPos(freq,  "x", true);
-        const py = u.valToPos(power, "y", true);
-        if (px && py) {
+        const drawOne = (pm, color, tag) => {
+            if (!pm) return;
+            const px = u.valToPos(pm.freq,  "x", true);
+            const py = u.valToPos(pm.power, "y", true);
+            if (!px || !py) return;
             ctx.beginPath();
             ctx.arc(px, py, 5, 0, 2 * Math.PI);
-            ctx.fillStyle   = "#f5d750";
+            ctx.fillStyle   = color;
             ctx.strokeStyle = "#000";
             ctx.lineWidth   = 1;
             ctx.fill();
             ctx.stroke();
-            ctx.fillStyle = "#f5d750";
+            ctx.fillStyle = color;
             ctx.font      = "bold 11px Menlo,monospace";
-            ctx.fillText(`${freq.toFixed(3)} MHz  ${power.toFixed(1)} dB`, px + 8, py - 5);
-        }
+            ctx.fillText(`${tag} ${pm.freq.toFixed(3)} MHz  ${pm.power.toFixed(1)} dB`, px + 8, py - 5);
+        };
+        drawOne(peakMarkerData.rx1, COL.rx1Max, "RX1");
+        drawOne(peakMarkerData.rx2, COL.rx2Max, "RX2");
     }
 
     // ── Band selection region ─────────────────────────────────────────────
@@ -1025,6 +1042,10 @@ document.getElementById("analysis-sel").addEventListener("change", (e) => {
 document.getElementById("win-sel").addEventListener("change", (e) => {
     windowMs = parseInt(e.target.value, 10);
     if (replaceMode) sendControl({ rows: rowsForCurrentSettings() });
+});
+
+document.getElementById("fps-sel").addEventListener("change", (e) => {
+    maxFps = parseFloat(e.target.value) || 15;   // client-side render cap (LV-U1a)
 });
 
 document.getElementById("auto-color").addEventListener("change", (e) => {

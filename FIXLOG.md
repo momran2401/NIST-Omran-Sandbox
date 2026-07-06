@@ -316,3 +316,20 @@ off, instead of silently no-op'ing.
 **Verify [demo]:** (a) toggle the crosshair off, change center — it stays off. (b) via Load JSON +
 Apply, a sweep that sets both sample_rate and duration yields the rows count for the new rate. (c)
 turn off Absolute RF and click Tune to band — the log shows the warning.
+
+---
+
+## Cluster 4 — UX/parity + docs
+
+### LV-U1 — Web parity extras: Max-fps throttle, per-channel peak markers, harmonized gain range
+**Files:** `live/web/index.html`, `live/web/app.js`
+**Changed:** (a) Added a "Max fps" select (15/10/5/2/1, default 15) to the Display group; `onFrame`
+parses the header then skips the block parse + render when `now - lastRender < 1000/maxFps`, so the
+meta fps reflects the actual (throttled) render rate. (b) Peak marker now renders one marker per
+visible channel — `drawPeakMarker(s1x, s2x, freqArr)` computes the strongest bin for each of RX1/RX2
+max (null-safe), drawn in `COL.rx1Max`/`COL.rx2Max` with "RX1"/"RX2" labels (was RX1-only with a
+generic label). (c) `#gain` range changed from −30…0 to **−60…+10** to match the server clamp, with
+a "AIR-T RX gain" tooltip. (Finding's (d) README parity note is not in the handoff prompt — skipped.)
+
+**Verify [demo]:** the fps throttle changes the meta fps; both peak markers track their channels;
+the gain spinner accepts −60…10.

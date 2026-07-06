@@ -63,7 +63,7 @@
 
         <div class="field-row">
             <label>Gain (dB)
-                <input type="number" id="gain" step="0.5" min="-30" max="0" value="0">
+                <input type="number" id="gain" step="0.5" min="-60" max="10" value="0" title="AIR-T RX gain">
             </label>
             <button id="gain-btn">Apply</button>
         </div>
@@ -111,6 +111,16 @@
                 <option value="200">200</option>
                 <option value="500">500</option>
                 <option value="1000">1000</option>
+            </select>
+        </label>
+
+        <label class="pro-only" title="Cap the browser render rate (drops excess frames)">Max fps
+            <select id="fps-sel">
+                <option value="15" selected>15</option>
+                <option value="10">10</option>
+                <option value="5">5</option>
+                <option value="2">2</option>
+                <option value="1">1</option>
             </select>
         </label>
 
