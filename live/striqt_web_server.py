@@ -434,6 +434,17 @@ ANALYSIS_CFG_KEYS = frozenset({
     "integration_bandwidth", "lo_bandstop", "trim_stopband",
 })
 
+# Hard-default analysis values — the final revert target for the P2a-3 backstop
+# (identical to the RadioConfig field defaults).
+ANALYSIS_DEFAULTS = {
+    "window":                DEFAULT_WINDOW,
+    "fractional_overlap":    DEFAULT_FRACTIONAL_OVERLAP,
+    "window_fill":           DEFAULT_WINDOW_FILL,
+    "integration_bandwidth": DEFAULT_INTEGRATION_BW,
+    "lo_bandstop":           DEFAULT_LO_BANDSTOP,
+    "trim_stopband":         DEFAULT_TRIM_STOPBAND,
+}
+
 
 def _parse_window(value):
     """Normalize a window spec to what scipy get_window accepts: a name string
@@ -585,10 +596,67 @@ class SharedConfig:
         self._cfg   = RadioConfig(backend=SPEC_BACKEND)
         self._dirty = False
         self._stop  = False
+        # P2a-3 backstop state: the analysis params of the last config that
+        # demonstrably computed a frame, and notices queued for the viewers.
+        self._last_good_analysis = None
+        self._notices = []
 
     def snapshot(self):
         with self._lock:
             return self._cfg.snapshot()
+
+    # --- Compute backstop (P2a-3) ---------------------------------------------
+
+    def note_good_analysis(self, cfg: "RadioConfig"):
+        """Remember the analysis params that just computed a frame successfully —
+        the revert target if a later config slips past validation and throws."""
+        good = {k: getattr(cfg, k) for k in ANALYSIS_CFG_KEYS}
+        with self._lock:
+            self._last_good_analysis = good
+
+    def revert_analysis(self, reason: str):
+        """
+        Backstop (belt and suspenders): the compute path caught an exception even
+        though tiers 1–2 should have prevented it. Revert the analysis params to
+        the last-good set (or the shipped defaults), keep streaming, and queue a
+        notice for the viewers. Returns the sorted reverted field names, or None
+        when the current params already match every revert target — i.e. the
+        error is not analysis-induced and reverting would change nothing.
+        """
+        with self._lock:
+            current = {k: getattr(self._cfg, k) for k in ANALYSIS_CFG_KEYS}
+            target = None
+            for candidate in (self._last_good_analysis, ANALYSIS_DEFAULTS):
+                if candidate and any(candidate[k] != current[k] for k in ANALYSIS_CFG_KEYS):
+                    target = candidate
+                    break
+            if target is None:
+                return None
+            changed = []
+            for key in ANALYSIS_CFG_KEYS:
+                if current[key] != target[key]:
+                    setattr(self._cfg, key, target[key])
+                    changed.append(key)
+            # The reverted overlap may have widened the per-row hop — re-clamp
+            # rows so the Computer's avail >= need gate stays reachable.
+            max_rows = max_live_rows(self._cfg)
+            if self._cfg.rows > max_rows:
+                self._cfg.rows = max_rows
+            changed = sorted(changed)
+        self.push_notice(
+            f"analysis error: {reason} — reverted {', '.join(changed)} to last-good values"
+        )
+        return changed
+
+    def push_notice(self, message: str):
+        with self._lock:
+            self._notices.append(str(message))
+            del self._notices[:-20]   # keep only the newest if no viewer drains
+
+    def drain_notices(self):
+        with self._lock:
+            notices, self._notices = self._notices, []
+            return notices
 
     def _validate_analysis(self, update: dict):
         """
@@ -1716,6 +1784,7 @@ class Computer(threading.Thread):
         super().__init__(daemon=True)
         self.acquirer = acquirer
         self.shared   = shared
+        self._last_err_notice = 0.0
 
     def run(self):
         interval = 1.0 / max(BROADCAST_FPS, 1.0)
@@ -1742,8 +1811,22 @@ class Computer(threading.Thread):
             try:
                 blocks, meta = compute_blocks(samples, cfg)
                 self.acquirer.publish(cfg, [blocks[i] for i in range(blocks.shape[0])], meta)
+                self.shared.note_good_analysis(cfg)
             except Exception as e:
+                # Backstop (P2a-3): even if a bad analysis param somehow reached
+                # the live compute, catch it, revert to the last-good analysis
+                # config, keep streaming, and surface the reason — the viewer
+                # must never freeze.
                 print(f"[compute] error: {e}")
+                reverted = self.shared.revert_analysis(str(e))
+                if reverted:
+                    print(f"[compute] reverted analysis params: {reverted}")
+                elif time.time() - self._last_err_notice > 5.0:
+                    # Not analysis-induced (nothing to revert) — tell the viewer
+                    # anyway, throttled so a persistent fault can't spam.
+                    self.shared.push_notice(f"compute error: {e}")
+                    self._last_err_notice = time.time()
+                time.sleep(0.1)
 
             # Pace to the broadcast rate; never busy-spin if compute outran it.
             next_t += interval
@@ -1786,6 +1869,7 @@ class DemoAcquirer(threading.Thread):
 
     def run(self):
         rng = np.random.default_rng(42)
+        last_err_notice = 0.0
         print("[demo] Synthetic IQ mode — no radio hardware used.")
         print("[demo] Two CW tones per channel + noise. Controls work normally.")
 
@@ -1816,8 +1900,17 @@ class DemoAcquirer(threading.Thread):
             try:
                 blocks, meta = compute_blocks(samples, cfg)
                 self._publish(cfg, [blocks[i] for i in range(blocks.shape[0])], meta)
+                self.shared.note_good_analysis(cfg)
             except Exception as e:
+                # Same backstop as the hardware Computer (P2a-3): revert to the
+                # last-good analysis config and keep the demo stream alive.
                 print(f"[demo] compute error: {e}")
+                reverted = self.shared.revert_analysis(str(e))
+                if reverted:
+                    print(f"[demo] reverted analysis params: {reverted}")
+                elif time.time() - last_err_notice > 5.0:
+                    self.shared.push_notice(f"compute error: {e}")
+                    last_err_notice = time.time()
 
             next_t += interval
             dt = next_t - time.time()
@@ -1964,6 +2057,17 @@ async def _broadcaster():
 
         if not _connections:
             continue
+
+        # Flush queued server notices (compute-backstop reverts etc.) to every
+        # viewer — even on ticks with no new frame, so a stalled compute still
+        # reports its reason (P2a-3).
+        for notice in _shared.drain_notices():
+            text = json.dumps({"message": f"[server] {notice}"})
+            for ws in list(_connections):
+                try:
+                    await ws.send_text(text)
+                except Exception:
+                    pass   # dropped clients are pruned by the frame loop below
 
         # latest() is fast (threading.Lock + numpy copy) — no executor needed
         header, blocks = _acquirer.latest()

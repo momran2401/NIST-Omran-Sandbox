@@ -544,3 +544,28 @@ applies (integral at nfft 1008); `frequency_resolution: 15000` rounds to 15238.1
 reason; `fractional_overlap: 0.464` snaps to `13/28`; a top-level `{"window": "boxcar"}` is
 stripped. All confirmed against the vendored striqt build. **Verify [hardware]:** same messages
 against the installed striqt build; a rejected value never interrupts the live feed.
+
+### P2a-3 — Compute backstop: catch, revert to last-good, keep streaming, surface reason
+**Files:** `live/striqt_web_server.py`
+**Changed:** Belt-and-suspenders tier 3 of the freedom model. `SharedConfig` now tracks the
+analysis params of the last config that **demonstrably computed a frame**
+(`note_good_analysis`, called by the Computer and the DemoAcquirer after every successful
+publish) plus a bounded notice queue (`push_notice`/`drain_notices`, newest 20 kept). If the
+live compute throws anyway — a param that slipped past tiers 1–2, or an installed-striqt
+behavior difference — the Computer/DemoAcquirer exception handler calls
+`revert_analysis(reason)`: it restores the last-good analysis params (escalating to the shipped
+defaults when the last-good set itself is what is failing), re-clamps `rows` against the
+restored hop, and queues a `[server] analysis error: … — reverted …` notice. When nothing
+differs from every revert target (i.e. the error is not analysis-induced), it reverts nothing
+and a throttled (≥5 s apart) `compute error: …` notice is queued instead — the stream is never
+silently stalled. The broadcaster flushes queued notices to every connected viewer each tick,
+even on ticks with no new frame, so app.js logs the reason while the last good frame keeps
+displaying. The viewer never freezes: the very next Computer iteration re-snapshots the
+reverted config and streaming resumes.
+
+**Verify [demo]:** force a bad value directly into the running cfg (bypassing validation) —
+the next compute logs the striqt error, reverts (`[server] analysis error: … — reverted window
+to last-good values` appears in the browser log), and frames keep flowing. Confirmed offline
+against the vendored striqt: revert restores last-good, escalates to defaults when last-good
+fails, and the reverted config computes again. **Verify [hardware]:** same, with the installed
+striqt build under live DMA load.
