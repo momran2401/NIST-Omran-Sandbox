@@ -333,3 +333,19 @@ a "AIR-T RX gain" tooltip. (Finding's (d) README parity note is not in the hando
 
 **Verify [demo]:** the fps throttle changes the meta fps; both peak markers track their channels;
 the gain spinner accepts −60…10.
+
+### LV-D1 — Retire the stale documentation
+**Files:** `CLAUDE.md`, `bug_report.md` (docs only — no code)
+**Changed:** (1) Replaced CLAUDE.md's "Known bugs" list (which described the pre-fix state and told
+sessions to re-add guards that already exist) with a note that all `bug_report.md` items were
+verified fixed 2026-07-06 (`AUDIT_REPORT.md` §5.C), pointing to `AUDIT_REPORT.md` §2/§5 and
+`FIXLOG.md` for the current backlog, and flagging S-5 as erroneous. (2) In the "spectrogram
+contract" section, removed the prescriptive "Always clear `striqt_shared.spectrogram_cache`"
+sentence (the cache is disabled by default → the `.clear()` calls are no-ops) and documented the
+`aligned_nfft`/28 constraint instead. (3) Added a HISTORICAL banner to the top of `bug_report.md`.
+The commit hash `da6f15c` from the handoff does not exist in this repo, so I referenced the audit
+verification date/section instead.
+
+**Verify [docs]:** `grep spectrogram_cache CLAUDE.md` returns only the debunking note (nothing
+prescriptive); the "Always clear …" instruction is gone; `bug_report.md` starts with the HISTORICAL
+banner. (Confirmed here.)
