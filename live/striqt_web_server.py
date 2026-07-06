@@ -138,7 +138,13 @@ DATA_STALE_SEC      = 1.0       # get_latest() returns None if the ring is older
 
 BROADCAST_FPS       = 15        # default max frames/sec to browsers
 SCROLL_ROWS         = 12        # rows per frame in Cool (scroll/waterfall) mode
-MAX_LIVE_ROWS       = 300       # safety cap on requested rows
+# Rows are bounded by what the IQ ring can actually supply (see max_live_rows()),
+# not a flat cap. The old MAX_LIVE_ROWS=300 pinned every long duration to 300 rows
+# and made the Duration control inert past ~10-20 ms (P1-5). MAX_ROWS_ABS is an
+# absolute ceiling protecting browser render + ring depth; RING_ROW_FILL leaves
+# headroom so the Computer's avail>=need gate is reached promptly.
+MAX_ROWS_ABS        = 4096      # absolute safety ceiling on requested rows
+RING_ROW_FILL       = 0.9       # fraction of MAX_TAIL usable for one frame's need
 
 # Allowed sample rates (LTE/5G-NR multiples of 1.92 MHz) and FFT sizes. Incoming
 # control values are snapped to the nearest of these so an off-list value can't
@@ -473,15 +479,16 @@ class SharedConfig:
                     mapped[key] = capture[key]
             if capture.get("duration") is not None:
                 try:
-                    with self._lock:
-                        cur_nfft = self._cfg.nfft
-                        cur_rate = self._cfg.sample_rate
                     # Map duration→rows using values from THIS message when it also
-                    # changes them, not the pre-update cfg (LV-R9b).
-                    nfft        = capture.get("nfft") or cur_nfft
-                    sample_rate = capture.get("sample_rate") or cur_rate
-                    rows = round(float(capture["duration"]) * float(sample_rate) / max(int(nfft), 1))
-                    mapped["rows"] = max(1, min(rows, MAX_LIVE_ROWS))
+                    # changes them, not the pre-update cfg (LV-R9b). Clamp to what
+                    # the ring can supply for the effective backend/nfft (P1-5).
+                    eff = self.snapshot()
+                    nfft        = int(capture.get("nfft") or eff.nfft)
+                    sample_rate = float(capture.get("sample_rate") or eff.sample_rate)
+                    eff.nfft = nfft
+                    eff.sample_rate = sample_rate
+                    rows = round(float(capture["duration"]) * sample_rate / max(nfft, 1))
+                    mapped["rows"] = max(1, min(rows, max_live_rows(eff)))
                 except Exception:
                     pass
             ignored = sorted(
@@ -533,9 +540,11 @@ class SharedConfig:
                         continue   # 0 == track sample_rate; otherwise a positive rate
                 else:
                     value = int(value) if key in {"nfft", "rows"} else float(value)
-                # Clamp rows so a misbehaving browser can't overload the radio
+                # Clamp rows to what the ring can supply for the current backend/
+                # nfft (P1-5). nfft, if changed in this same message, is applied
+                # earlier in the loop, so self._cfg already reflects it here.
                 if key == "rows":
-                    value = int(max(1, min(value, MAX_LIVE_ROWS)))
+                    value = int(max(1, min(value, max_live_rows(self._cfg))))
                 elif key == "center":
                     value = float(max(300e6, min(value, 6e9)))
                 elif key == "sample_rate":
@@ -858,6 +867,28 @@ def calibrated_sample_count(nfft: int, rows: int) -> int:
     nfft = int(nfft)
     hop = (nfft * 15) // 28
     return int(rows * hop + (nfft - hop))
+
+
+def max_live_rows(cfg: RadioConfig) -> int:
+    """
+    Largest number of display rows the IQ ring can actually supply for `cfg`'s
+    backend and FFT size (P1-5). Replaces the old flat 300-row clamp, which pinned
+    every long duration to 300 rows and made the Duration control inert past
+    ~10-20 ms. The bound is honest, not cosmetic: `samples_needed(rows)` must stay
+    within `RING_ROW_FILL·MAX_TAIL` so the Computer's `avail >= need` gate is
+    reached promptly (otherwise a too-large request would starve the display), and
+    never exceed the absolute `MAX_ROWS_ABS` ceiling. A longer duration therefore
+    renders more rows (and, on the calibrated path, costs more FFTs → fps may fall,
+    which is expected and left honest — the cap protects the radio, not the fps).
+    """
+    limit = int(MAX_TAIL * RING_ROW_FILL)
+    if cfg.backend in {"calibrated", "ssb"}:
+        nfft = aligned_nfft(cfg.nfft)
+        hop  = max(1, (nfft * 15) // 28)
+        rows = (limit - (nfft - hop)) // hop
+    else:
+        rows = limit // max(1, int(cfg.nfft))
+    return int(max(1, min(rows, MAX_ROWS_ABS)))
 
 
 def fit_display_rows(

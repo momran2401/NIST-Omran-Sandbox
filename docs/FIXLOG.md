@@ -447,3 +447,29 @@ P1-5 raises it; after P1-5 the full 2→100 ms range renders honestly.
 **Verify [demo]:** picking each preset changes the displayed time span (and the `↕ N ms` label);
 "custom…" reveals the box and a typed value applies. In ARIC mode only the presets are offered
 (no custom box).
+
+### P1-5 — Remove the 300-row cap so duration actually renders more time
+**Files:** `live/striqt_web_server.py`, `live/web/app.js`
+**Changed:** Replaced the flat `MAX_LIVE_ROWS = 300` clamp (which pinned every long duration to
+300 rows — why duration "did nothing" past ~10-20 ms) with `max_live_rows(cfg)`: the largest rows
+the IQ ring can actually supply for the current backend/nfft, bounded so
+`samples_needed(rows) ≤ RING_ROW_FILL·MAX_TAIL` (0.9·4M) — keeping the Computer's `avail ≥ need`
+gate reachable — and never above an absolute `MAX_ROWS_ABS = 4096` ceiling. Both server clamp
+sites (`rows` control key and the `capture.duration→rows` mapping) now use it. Client-side,
+`rowsForWindow`'s hard `Math.min(…, 300)` became `Math.min(…, CLIENT_MAX_ROWS=4096)`. The ceiling
+protects browser render + ring depth, not the fps: a longer duration means more FFTs per calibrated
+frame, so **fps may fall — left honest** (the meta fps is unchanged in spirit from the audit). At
+settings where the requested span can't fit the ceiling, the rows are clamped and the meta/axis
+`ms` label honestly reflects the **actual** rows shown, not the request.
+**Honest consequence:** large row counts also mean large frames (≈ rows·nfft·4·2 bytes) — e.g. an
+800-row nfft-1024 quicklook frame is ~6.5 MB; over a slow link this raises bandwidth and can drop
+fps. Use `--quantize` (uint8, ~4× smaller) for constrained links. This is expected, not hidden.
+**Scope note:** only the web viewer's `MAX_LIVE_ROWS` was removed; the separate
+`striqt_standalone.py` / `pluto_standalone.py` / `web_sim` scripts keep their own 300-row GUI caps
+(out of scope for Phase 1).
+
+**Verify [demo]:** a 100 ms duration renders visibly more time depth than 10 ms (more rows); the
+meta `window/duration` label matches the selected value rather than clamping. Confirmed over WS: a
+`{rows:800}` request now yields 800-row frames (was capped at 300), and `{rows:99999}` is honestly
+clamped to the ring capacity (3686 rows at quicklook/nfft-1024), with `samples_needed < MAX_TAIL`
+for every backend/nfft.

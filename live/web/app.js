@@ -155,11 +155,18 @@ function backendHopFrac() {
     return curBackend === "quicklook" ? 1 : 15 / 28;
 }
 
+// Absolute ceiling on client-side display rows — matches the server's
+// MAX_ROWS_ABS (P1-5). Protects browser render/memory; the old 300 clamp pinned
+// every long duration to the same span and made the Duration control inert.
+const CLIENT_MAX_ROWS = 4096;
+
 // Rows the display window spans. windowMs of signal advances by (radioNfft·hopFrac)
 // samples per STFT row, so rows = windowMs·fs / (radioNfft·hopFrac). Uses the
-// requested radio FFT size, NOT the per-frame averaged bin count.
+// requested radio FFT size, NOT the per-frame averaged bin count. The cap is a
+// generous safety ceiling (not a low clamp), so a longer duration honestly
+// renders more rows — the meta/axis ms label reflects the actual rows shown.
 function rowsForWindow(fs, radioNfft, windowMs, hopFrac) {
-    return Math.max(1, Math.min(Math.round(windowMs / 1000 * fs / (radioNfft * hopFrac)), 300));
+    return Math.max(1, Math.min(Math.round(windowMs / 1000 * fs / (radioNfft * hopFrac)), CLIENT_MAX_ROWS));
 }
 
 // Mirror of the server's ssb_grid_compatible: the true SSB path needs the sample
