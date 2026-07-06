@@ -1410,6 +1410,59 @@ document.getElementById("settings-upload").addEventListener("change", async (e) 
 });
 
 // ---------------------------------------------------------------------------
+// Analysis panel (P2a-6) — DAN-mode editors for the striqt Spectrogram params
+// ---------------------------------------------------------------------------
+//
+// Free-text by design (the freedom model): values are sent raw and the SERVER
+// snaps knowable constraints ("invalid X → using Y" via handleAck) or lets
+// striqt scratch-validate the rest before the live stream sees anything. The
+// fields seed from /config and re-seed after every ack, so what the panel
+// shows is always what the server actually runs.
+
+const ANALYSIS_FIELDS = [
+    { id: "an-window",     key: "window" },
+    { id: "an-freqres",    key: "frequency_resolution" },
+    { id: "an-overlap",    key: "fractional_overlap" },
+    { id: "an-fill",       key: "window_fill" },
+    { id: "an-integ",      key: "integration_bandwidth" },
+    { id: "an-lobandstop", key: "lo_bandstop" },
+    { id: "an-trim",       key: "trim_stopband", checkbox: true },
+];
+
+function seedAnalysisForm(config) {
+    const an = (config && config.analysis) || {};
+    for (const f of ANALYSIS_FIELDS) {
+        const el = document.getElementById(f.id);
+        if (!el || !(f.key in an)) continue;
+        const v = an[f.key];
+        if (f.checkbox) {
+            el.checked = Boolean(v);
+        } else if (Array.isArray(v)) {
+            el.value = v.join(", ");            // ["kaiser", 11.88] → "kaiser, 11.88"
+        } else if (v === null || v === undefined) {
+            el.value = "none";
+        } else {
+            el.value = String(v);
+        }
+    }
+}
+
+document.getElementById("analysis-apply").addEventListener("click", () => {
+    const analysis = {};
+    for (const f of ANALYSIS_FIELDS) {
+        const el = document.getElementById(f.id);
+        if (!el) continue;
+        if (f.checkbox) {
+            analysis[f.key] = el.checked;
+        } else if (el.value.trim() !== "") {    // cleared fields are not sent
+            analysis[f.key] = el.value.trim();
+        }
+    }
+    sendControl({ analysis });
+    logMsg("Analysis settings sent");
+});
+
+// ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
 

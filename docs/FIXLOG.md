@@ -624,3 +624,28 @@ is also the correct home on the radio's own striqt build regardless of its dbm b
 reason, and a bare Apply after page load changes nothing (`applied []`). A no-striqt stock
 `python3 --demo` boot still works (quicklook, tier 2 a no-op). **Verify [hardware]:** apply a
 new window on the installed build — no SQLite/threading rejection; `/config` reflects it.
+
+### P2a-6 — Analysis panel UI (DAN mode)
+**Files:** `live/web/index.html`, `live/web/app.js`, `live/web/style.css`
+**Changed:** New **Analysis** column in the DAN-mode settings panel (`#settings-panel` is
+`pro-only`, so ARIC mode never sees it): free-text inputs for `window` (accepts `hann` or
+`kaiser, 11.88` shorthand), `frequency resolution (Hz)`, `fractional overlap`, `window fill`
+(fraction strings like `13/28` or decimals), `integration bandwidth` (`auto | none | Hz`),
+`LO bandstop` (`none | Hz`), and a `trim stopband` checkbox, plus an **Apply analysis** button.
+No client-side guardrails by design (the freedom model): values are sent raw as
+`{"analysis": {...}}`; the server snaps knowable constraints (shown by `handleAck` as
+`invalid X=… → using Y (reason)` + an "adjusted" status) or lets striqt scratch-validate and
+reject (`rejected X: <striqt reason>` + a "kept last-good config" status) — the stream never
+freezes either way. Fields seed from `/config` on load and re-seed after every ack, so the
+panel always shows what the server actually runs, a bare Apply changes nothing
+(`applied []`), and a rounded value (e.g. frequency resolution) snaps back to the executed one
+in the box. `#settings-editor` switched to an auto-fit grid to hold the third column.
+
+**Verify [demo]:** on 8001 in DAN mode the Analysis column renders (absent in ARIC); bare
+Apply → `applied []`; editing window to `blackmanharris` applies and the waterfall texture
+changes; `notawindow` is rejected in the log/status and the stream keeps running; setting
+capture `analysis_bandwidth` 10 MHz + trim stopband shrinks the frame to 53 bins with an exact
+±4.76 MHz axis (confirmed over WS with panel-identical payloads). **Verify [hardware]:** each
+param visibly changes the calibrated spectrogram (window sidelobes, overlap row density,
+integration smoothing, LO notch width); a deliberately-illegal param is caught and reported
+without killing the live feed.
