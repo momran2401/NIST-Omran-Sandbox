@@ -252,3 +252,20 @@ frame renders; all-NaN block hits the fallback.
 **Verify [demo]:** temporarily set `blocks[0][0,0]=np.nan` in `compute_blocks` and run
 `--demo --quantize` → the waterfall still renders normally (previously all-noise); remove the
 injection.
+
+### LV-R5 — Suppress zero-padded / mislabeled frames across a retune (generation tag)
+**File:** `live/striqt_web_server.py`
+**Changed:** Added `Acquirer._gen`, bumped inside `_clear_ring_locked` (i.e. on every retune/recover
+ring clear). `get_latest` now returns `(out, gen, avail)`; new `generation()` reads it under the
+lock. `Computer.run` snapshots `g0 = generation()` before `get_latest` and skips the frame when
+`gen != g0` (ring cleared mid-read) or `avail < need` (ring hasn't refilled) — so no dark
+zero-padded rows flash and no frame is computed from a ring cleared under it. `DemoAcquirer`
+(no ring) is untouched.
+**Residual (acknowledged in the finding):** a ≤1-frame (~one read cycle) window remains where the
+SharedConfig is updated but the Acquirer hasn't yet processed the dirty flag to clear the ring;
+fully closing it would require tagging ring samples with their cfg. The dark-flash (zero-pad) case
+is fully eliminated.
+
+**Verify [hardware]:** not reproducible in `--demo` (no ring). On hardware, rapid center changes —
+the waterfall must never flash dark rows nor show the previous band's energy under the new center
+label.

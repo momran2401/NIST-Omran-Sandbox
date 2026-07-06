@@ -975,6 +975,7 @@ class Acquirer(threading.Thread):
         self._count       = 0      # total samples written (saturates at MAX_TAIL)
         self._last_write  = 0.0
         self._healthy     = False
+        self._gen         = 0      # bumped on every ring clear (retune/recover) — LV-R5
 
     # --- Latest-frame slot (thread-safe) ---
 
@@ -998,6 +999,7 @@ class Acquirer(threading.Thread):
         self._count      = 0
         self._last_write = 0.0
         self._healthy    = False
+        self._gen       += 1   # invalidate frames straddling this retune/recover (LV-R5)
 
     def _ring_write(self, iq):
         """Append raw IQ (channels, n) into the ring buffer with wraparound."""
@@ -1026,12 +1028,17 @@ class Acquirer(threading.Thread):
             self._last_write = time.time()
             self._healthy    = True
 
+    def generation(self):
+        with self._lock:
+            return self._gen
+
     def get_latest(self, n):
         """
-        Return the most recent `n` complex samples per channel, shape
-        (channels, n) complex64, chronological (oldest -> newest). Front-padded
-        with zeros if fewer than `n` exist. Returns None if the ring is empty or
-        stale (so frames never mix old-tuning samples after a retune).
+        Return (out, gen, avail): the most recent `n` complex samples per channel,
+        shape (channels, n) complex64, chronological (oldest -> newest), front-padded
+        with zeros if fewer than `n` exist; `gen` is the ring generation and `avail`
+        the real sample count. Returns None if the ring is empty or stale (so frames
+        never mix old-tuning samples after a retune).
         """
         n = int(n)
         if n <= 0:
@@ -1052,7 +1059,8 @@ class Acquirer(threading.Thread):
                 first = cap - start
                 out[:, n - take:n - take + first] = self._ring[:, start:]
                 out[:, n - take + first:]         = self._ring[:, : take - first]
-        return out
+            gen = self._gen
+        return out, gen, avail
 
     # --- Hardware management ---
 
@@ -1193,9 +1201,19 @@ class Computer(threading.Thread):
         next_t   = time.time()
         while not self.shared.stopped():
             cfg     = self.shared.snapshot()
-            samples = self.acquirer.get_latest(samples_needed(cfg))
-            if samples is None:
+            need    = samples_needed(cfg)
+            g0      = self.acquirer.generation()
+            latest  = self.acquirer.get_latest(need)
+            if latest is None:
                 # Ring empty/stale (startup or just after a retune) — wait.
+                time.sleep(0.03)
+                next_t = time.time()
+                continue
+            samples, gen, avail = latest
+            # Skip frames straddling a retune: the ring was cleared (gen bumped) or
+            # hasn't refilled yet (avail < need). Either would publish zero-padded
+            # dark rows or mislabel old-band energy with the new header (LV-R5).
+            if gen != g0 or avail < need:
                 time.sleep(0.03)
                 next_t = time.time()
                 continue
