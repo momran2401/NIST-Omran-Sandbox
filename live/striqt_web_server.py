@@ -140,6 +140,17 @@ BROADCAST_FPS       = 15        # default max frames/sec to browsers
 SCROLL_ROWS         = 12        # rows per frame in Cool (scroll/waterfall) mode
 MAX_LIVE_ROWS       = 300       # safety cap on requested rows
 
+# Allowed sample rates (LTE/5G-NR multiples of 1.92 MHz) and FFT sizes. Incoming
+# control values are snapped to the nearest of these so an off-list value can't
+# reach arm_spec or trip the calibrated ValueError guard (LV-R2).
+RATES_HZ      = (3.84e6, 7.68e6, 15.36e6, 30.72e6)
+NFFT_CHOICES  = (256, 512, 1024, 2048, 4096)
+
+
+def _snap(value, choices):
+    return min(choices, key=lambda c: abs(c - value))
+
+
 WEB_DIR = Path(__file__).parent / "web"
 
 # Backend: "calibrated" (striqt PSD/ENBW dB) or "quicklook" (simple FFT dB)
@@ -473,10 +484,12 @@ class SharedConfig:
                 elif key == "center":
                     value = float(max(300e6, min(value, 6e9)))
                 elif key == "sample_rate":
+                    value = float(_snap(value, RATES_HZ))
                     value = float(max(1e6, min(value, 125e6)))
                 elif key == "gain":
                     value = float(max(-60.0, min(value, 10.0)))
                 elif key == "nfft":
+                    value = int(_snap(value, NFFT_CHOICES))
                     value = int(max(128, min(value, 8192)))
                 old = getattr(self._cfg, key)
                 if old == value:
@@ -1475,6 +1488,10 @@ async def ws_endpoint(ws: WebSocket):
         while True:
             try:
                 text = await asyncio.wait_for(ws.receive_text(), timeout=15.0)
+            except asyncio.TimeoutError:
+                # Keepalive: no control data in 15 s is normal.
+                continue
+            try:
                 ctrl = json.loads(text)
                 ack = _shared.update(ctrl)
                 # Acknowledge settings-editor applies so the UI can show what took
@@ -1483,9 +1500,10 @@ async def ws_endpoint(ws: WebSocket):
                     await ws.send_text(json.dumps({"message":
                         f"settings — applied {ack['applied']}; "
                         f"ignored {ack['ignored']}; reconnect-only {ack['reconnect']}"}))
-            except asyncio.TimeoutError:
-                # Keepalive: connection stays open, no data in 15 s is normal
-                pass
+            except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
+                # A single malformed control message must never drop the (only)
+                # viewer connection (LV-R2).
+                await ws.send_text(json.dumps({"message": f"bad control ignored: {e}"}))
     except WebSocketDisconnect:
         pass
     except Exception as e:

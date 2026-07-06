@@ -205,3 +205,19 @@ a driver fault routes to the existing `_recover`/retry path instead of killing t
 **Verify [hardware]:** monkeypatch `_read_stream` to raise `RuntimeError("injected")` once (a
 temporary shim around the read in a dev run); the log shows `[radio] recovering after: injected`
 and frames resume. (Not reproducible in `--demo`, which uses `DemoAcquirer` with no read loop.)
+
+### LV-R2 — Harden the WS control channel (validate/snap; never let bad JSON kill the viewer)
+**File:** `live/striqt_web_server.py`
+**Changed:** (1) `ws_endpoint` now splits the receive from the parse: `receive_text` timeout is a
+keepalive `continue`, and `json.loads` + `_shared.update` (+ the ack send) are wrapped in
+`except (json.JSONDecodeError, ValueError, TypeError, AttributeError)` → replies
+`{"message":"bad control ignored: …"}` and keeps looping, so one malformed message can't drop the
+only viewer. (2) `SharedConfig.update` snaps `sample_rate` to the nearest of
+`RATES_HZ = (3.84,7.68,15.36,30.72) MHz` and `nfft` to the nearest of
+`NFFT_CHOICES = (256,512,1024,2048,4096)` (new `_snap` helper) before the existing clamps, so an
+off-list value can't reach `arm_spec` or trip the calibrated `ValueError` guard. Verified snapping:
+9 MS/s→7.68, 30.72M still retunes, 700→512.
+
+**Verify [demo]:** in the browser console, `ws.send("garbage")`, `ws.send('{"center":"abc"}')`,
+and `ws.send('{"sample_rate":9e6}')` leave the stream running and log an ignore message;
+`ws.send('{"sample_rate":30720000}')` still retunes.
