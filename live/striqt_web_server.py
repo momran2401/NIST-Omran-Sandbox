@@ -171,6 +171,18 @@ SSB_SAMPLE_RATE = 7.68e6
 SSB_DISCOVERY_PERIOD = 20e-3
 SSB_LO_BANDSTOP = 120e3
 
+# Default striqt Spectrogram recipe — the exact values calibrated_spectrogram
+# hardcoded before P2a-1. These seed the editable analysis params in RadioConfig,
+# so behaviour is unchanged until the user edits them from the Analysis panel.
+# integration_bandwidth "auto" reproduces the old frequency_resolution ×
+# averaging_factor(nfft) coupling (the only value that tracks nfft changes).
+DEFAULT_WINDOW             = ("kaiser", 11.88)
+DEFAULT_FRACTIONAL_OVERLAP = Fraction(13, 28)
+DEFAULT_WINDOW_FILL        = Fraction(15, 28)
+DEFAULT_INTEGRATION_BW     = "auto"
+DEFAULT_LO_BANDSTOP        = SSB_LO_BANDSTOP
+DEFAULT_TRIM_STOPBAND      = False
+
 
 # ---------------------------------------------------------------------------
 # HTTP Basic Auth (single shared credential, read from the environment)
@@ -425,6 +437,22 @@ class RadioConfig:
     lo_shift:            str   = "none"
     host_resample:       bool  = False
     backend_sample_rate: float = 0.0
+    # striqt Spectrogram analysis params (P2a-1) — drive the calibrated backend's
+    # spec instead of the old hardcodes. All immutable values (str/tuple/Fraction/
+    # None), so snapshot() can pass them through. Only validated values may land
+    # here (the freedom model in SharedConfig.update guards every write).
+    #   window:                scipy get_window spec — a name or (name, param)
+    #   fractional_overlap:    Fraction of each FFT window shared with its neighbor
+    #   window_fill:           Fraction of the window filled by the taper (rest zeros)
+    #   integration_bandwidth: "auto" (freq_res × averaging_factor), None, or Hz
+    #   lo_bandstop:           None or Hz nulled at DC by striqt
+    #   trim_stopband:         trim the frequency axis to analysis_bandwidth
+    window:                object = DEFAULT_WINDOW
+    fractional_overlap:    Fraction = DEFAULT_FRACTIONAL_OVERLAP
+    window_fill:           Fraction = DEFAULT_WINDOW_FILL
+    integration_bandwidth: object = DEFAULT_INTEGRATION_BW
+    lo_bandstop:           object = DEFAULT_LO_BANDSTOP
+    trim_stopband:         bool   = DEFAULT_TRIM_STOPBAND
 
     def snapshot(self):
         return RadioConfig(
@@ -439,6 +467,12 @@ class RadioConfig:
             lo_shift=str(self.lo_shift),
             host_resample=bool(self.host_resample),
             backend_sample_rate=float(self.backend_sample_rate),
+            window=self.window,
+            fractional_overlap=self.fractional_overlap,
+            window_fill=self.window_fill,
+            integration_bandwidth=self.integration_bandwidth,
+            lo_bandstop=self.lo_bandstop,
+            trim_stopband=bool(self.trim_stopband),
         )
 
 
@@ -730,48 +764,91 @@ def db_spectrogram(samples: np.ndarray, nfft: int, rows: int) -> np.ndarray:
     # Normalize by window power (proper PSD estimate)
     power  = (np.abs(spec) ** 2) / max(float(np.sum(window ** 2)), 1.0)
     spg = (10.0 * np.log10(power + 1e-20)).astype(np.float32)
-    # Quicklook is a plain fftshifted per-bin FFT: fft_nfft = nfft, no averaging.
-    return spg, {"fft_nfft": int(nfft), "bin_avg": 1}
+    # Quicklook is a plain fftshifted per-bin FFT: fft_nfft = nfft, no averaging,
+    # non-overlapping rows (hop = nfft).
+    return spg, {"fft_nfft": int(nfft), "bin_avg": 1, "hop_size": int(nfft)}
 
 
-def calibrated_spectrogram(
-    samples: np.ndarray, nfft: int, rows: int, sample_rate: float, lo_null: bool = True
-) -> tuple:
+def analysis_hop(nfft: int, fractional_overlap=DEFAULT_FRACTIONAL_OVERLAP) -> int:
     """
-    striqt-calibrated PSD spectrogram with symbol-style overlap/fill and
-    frequency-bin averaging. Returns (blocks, meta) — blocks (channels, rows,
-    bins) float32, meta {fft_nfft, bin_avg}.
+    Samples the STFT advances per displayed row: nfft − noverlap, where noverlap
+    is computed exactly as striqt does (`round(fractional_overlap * nfft)` on the
+    Fraction). At the default 13/28 overlap this is the familiar nfft·15/28.
+    """
+    nfft = int(nfft)
+    noverlap = round(Fraction(fractional_overlap) * nfft)
+    return max(1, nfft - int(noverlap))
+
+
+def resolve_integration_bandwidth(value, nfft: int, sample_rate: float):
+    """
+    Map the cfg integration_bandwidth ("auto" | None | Hz) to the value striqt
+    receives. "auto" reproduces the pre-P2a behaviour: frequency_resolution ×
+    averaging_factor(nfft), the only choice that tracks nfft changes.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return (sample_rate / float(nfft)) * averaging_factor(nfft)   # "auto"
+    return float(value)
+
+
+def make_analysis_spec(cfg: "RadioConfig", nfft: int, sample_rate: float):
+    """Build the striqt Spectrogram spec from cfg's analysis params (P2a-1)."""
+    frequency_resolution = float(sample_rate) / float(nfft)
+    integration = resolve_integration_bandwidth(
+        cfg.integration_bandwidth, nfft, sample_rate
+    )
+    lo = cfg.lo_bandstop
+    return analysis_specs.Spectrogram(
+        window=cfg.window,
+        frequency_resolution=frequency_resolution,
+        fractional_overlap=Fraction(cfg.fractional_overlap),
+        window_fill=Fraction(cfg.window_fill),
+        integration_bandwidth=integration,
+        trim_stopband=bool(cfg.trim_stopband),
+        lo_bandstop=(float(lo) if lo else None),
+    )
+
+
+def calibrated_spectrogram(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
+    """
+    striqt-calibrated PSD spectrogram driven by cfg's analysis params (P2a-1) —
+    window, overlap, fill, integration bandwidth, LO bandstop, stopband trim.
+    Returns (blocks, meta) — blocks (channels, rows, bins) float32, meta
+    {fft_nfft, bin_avg, hop_size, freqs_hz_f0, freqs_hz_step}.
     """
     if not _ANALYSIS_OK:
         raise RuntimeError(f"calibrated backend unavailable: {_ANALYSIS_ERR!r}")
 
     samples = np.asarray(samples, dtype=np.complex64)
-    nfft = aligned_nfft(nfft)
-    # Right-size to exactly `rows` STFT rows under the 13/28 overlap, rather than
-    # computing ~1.87×rows rows and discarding all but the last `rows` (LV-W2).
-    needed  = calibrated_sample_count(nfft, rows)
+    rows        = int(cfg.rows)
+    sample_rate = float(cfg.sample_rate)
+    nfft        = aligned_nfft(cfg.nfft)
+    hop         = analysis_hop(nfft, cfg.fractional_overlap)
+    # Right-size to exactly `rows` STFT rows under the configured overlap, rather
+    # than computing extra rows and discarding all but the last `rows` (LV-W2).
+    needed = calibrated_sample_count(nfft, rows, hop)
     if samples.shape[1] < needed:
         pad = np.zeros((samples.shape[0], needed - samples.shape[1]), dtype=np.complex64)
         samples = np.concatenate([samples, pad], axis=1)
     else:
         samples = samples[:, -needed:]
 
-    sample_rate = float(sample_rate)
+    # Carry the real analysis_bandwidth so trim_stopband=True has something to
+    # trim to; with the default trim=False / bandwidth=inf this is inert.
     capture = analysis_specs.Capture(
         sample_rate=sample_rate,
         duration=needed / sample_rate,
-        analysis_bandwidth=float("inf"),
+        analysis_bandwidth=float(cfg.analysis_bandwidth),
     )
-    frequency_resolution = sample_rate / float(nfft)
-    average_bins = averaging_factor(nfft)
-    spec = analysis_specs.Spectrogram(
-        window=("kaiser", 11.88),
-        frequency_resolution=frequency_resolution,
-        fractional_overlap=Fraction(13, 28),
-        window_fill=Fraction(15, 28),
-        integration_bandwidth=frequency_resolution * average_bins,
-        trim_stopband=False,
-        lo_bandstop=SSB_LO_BANDSTOP,
+    spec = make_analysis_spec(cfg, nfft, sample_rate)
+    integration = resolve_integration_bandwidth(
+        cfg.integration_bandwidth, nfft, sample_rate
+    )
+    average_bins = (
+        1 if integration is None
+        else max(1, round(integration / (sample_rate / nfft)))
     )
     striqt_shared.spectrogram_cache.clear()
     spg, _ = striqt_shared.evaluate_spectrogram(
@@ -779,25 +856,37 @@ def calibrated_spectrogram(
     )
     blocks = fit_display_rows(
         np.asarray(spg, dtype=np.float32), rows,
-        bin_avg=average_bins, fft_nfft=nfft, sample_rate=sample_rate, lo_null=lo_null,
+        bin_avg=average_bins, fft_nfft=nfft, sample_rate=sample_rate,
+        lo_null=cfg.lo_null, lo_bandstop=cfg.lo_bandstop,
     )
-    return blocks, {"fft_nfft": int(nfft), "bin_avg": int(average_bins)}
+    meta = {"fft_nfft": int(nfft), "bin_avg": int(average_bins), "hop_size": int(hop)}
+    # Ship striqt's own frequency coordinates so the header axis is exact for ANY
+    # analysis params (trim/averaging change the bin grid in ways the header's
+    # symmetric-about-DC fallback can only approximate). Additive: build_header
+    # uses these when present, keeping the LV-F1 axis contract.
+    try:
+        freqs = striqt_shared.spectrogram_freqs(capture, spec)
+        freqs = np.asarray(freqs, dtype=np.float64)
+        if freqs.size >= 2:
+            meta["freqs_hz_f0"]   = float(freqs[0])
+            meta["freqs_hz_step"] = float(freqs[1] - freqs[0])
+    except Exception:
+        pass   # fall back to build_header's symmetric axis
+    return blocks, meta
 
 
-def ssb_spectrogram(
-    samples: np.ndarray, nfft: int, rows: int, sample_rate: float, lo_null: bool = True
-) -> tuple:
+def ssb_spectrogram(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
     """
     5G SSB spectrogram path from striqt. The returned SSB block and symbol axes
     are flattened to the dashboard's existing rows x bins frame contract.
-    Returns (blocks, meta).
+    Returns (blocks, meta). SSB analysis params stay hardcoded (Phase 2b).
     """
     if not _ANALYSIS_OK:
         raise RuntimeError(f"SSB backend unavailable: {_ANALYSIS_ERR!r}")
 
     samples = np.asarray(samples, dtype=np.complex64)
-    nfft = aligned_nfft(nfft)
-    sample_rate = float(sample_rate)
+    rows        = int(cfg.rows)
+    sample_rate = float(cfg.sample_rate)
     capture = analysis_specs.Capture(
         sample_rate=sample_rate,
         duration=samples.shape[1] / sample_rate,
@@ -821,8 +910,8 @@ def ssb_spectrogram(
             raise
         # The live viewer's power-of-two sample-rate/FFT controls are not
         # always compatible with the strict 30 kHz SSB grid. Keep the selector
-        # useful by falling back to the same 13/28, 15/28 averaged grid.
-        return calibrated_spectrogram(samples, nfft, rows, sample_rate, lo_null=lo_null)
+        # useful by falling back to the same calibrated averaged grid.
+        return calibrated_spectrogram(samples, cfg)
     spg = np.asarray(spg, dtype=np.float32)
     if spg.ndim == 4:
         spg = spg.reshape(spg.shape[0], spg.shape[1] * spg.shape[2], spg.shape[3])
@@ -831,9 +920,12 @@ def ssb_spectrogram(
     ssb_nfft = max(1, round(sample_rate / (SSB_SUBCARRIER_SPACING / 2)))
     blocks = fit_display_rows(
         spg, rows,
-        bin_avg=1, fft_nfft=ssb_nfft, sample_rate=sample_rate, lo_null=lo_null,
+        bin_avg=1, fft_nfft=ssb_nfft, sample_rate=sample_rate,
+        lo_null=cfg.lo_null, lo_bandstop=SSB_LO_BANDSTOP,
     )
-    return blocks, {"fft_nfft": int(ssb_nfft), "bin_avg": 1}
+    # Best-effort hop: one SSB symbol row spans ~1/subcarrier_spacing of signal.
+    hop = max(1, round(sample_rate / SSB_SUBCARRIER_SPACING))
+    return blocks, {"fft_nfft": int(ssb_nfft), "bin_avg": 1, "hop_size": int(hop)}
 
 
 # Snap the requested FFT size to a smooth multiple of 28 that is ALSO divisible
@@ -855,18 +947,28 @@ def averaging_factor(nfft: int) -> int:
     return 1
 
 
-def calibrated_sample_count(nfft: int, rows: int) -> int:
+def calibrated_sample_count(nfft: int, rows: int, hop=None) -> int:
     """
-    Samples needed to produce exactly `rows` STFT rows under the 13/28 overlap.
-    Each displayed row advances the STFT by hop = nfft·15/28 samples, so
-    rows·hop + (nfft-hop) samples suffice — instead of the ~1.87× that rows·nfft
-    would compute and then discard (see AUDIT_REPORT.md LV-W2). `nfft` must be an
-    aligned FFT size (multiple of 28) so the hop divides evenly; the count then
-    reproduces striqt's own row formula int((nfft/hop)·(N/nfft-1)+1) == rows.
+    Samples needed to produce exactly `rows` STFT rows under the configured
+    overlap. Each displayed row advances the STFT by `hop` samples (nfft·15/28 at
+    the default 13/28 overlap), so rows·hop + (nfft-hop) samples suffice — instead
+    of the ~1.87× that rows·nfft would compute and then discard (see
+    AUDIT_REPORT.md LV-W2). The count reproduces striqt's own row formula
+    int((nfft/hop)·(N/nfft-1)+1) == rows for any hop that divides its terms.
     """
     nfft = int(nfft)
-    hop = (nfft * 15) // 28
+    if hop is None:
+        hop = (nfft * 15) // 28
+    hop = max(1, int(hop))
     return int(rows * hop + (nfft - hop))
+
+
+def row_hop(cfg: RadioConfig) -> int:
+    """Samples of signal one display row spans for cfg's backend (P2a-1)."""
+    if cfg.backend in {"calibrated", "ssb"}:
+        nfft = aligned_nfft(cfg.nfft)
+        return analysis_hop(nfft, cfg.fractional_overlap)
+    return max(1, int(cfg.nfft))
 
 
 def max_live_rows(cfg: RadioConfig) -> int:
@@ -884,7 +986,7 @@ def max_live_rows(cfg: RadioConfig) -> int:
     limit = int(MAX_TAIL * RING_ROW_FILL)
     if cfg.backend in {"calibrated", "ssb"}:
         nfft = aligned_nfft(cfg.nfft)
-        hop  = max(1, (nfft * 15) // 28)
+        hop  = analysis_hop(nfft, cfg.fractional_overlap)
         rows = (limit - (nfft - hop)) // hop
     else:
         rows = limit // max(1, int(cfg.nfft))
@@ -899,6 +1001,7 @@ def fit_display_rows(
     fft_nfft=None,
     sample_rate=None,
     lo_null: bool = True,
+    lo_bandstop=SSB_LO_BANDSTOP,
 ) -> np.ndarray:
     """Crop/pad a striqt spectrogram to the dashboard row contract."""
     spg = np.asarray(spg, dtype=np.float32)
@@ -915,12 +1018,14 @@ def fit_display_rows(
             )
             spg = np.concatenate([pad, spg], axis=1)
 
-    # Null the LO leakage region, sized to the striqt bandstop instead of a fixed
-    # ±2 bins (which hid up to ~3.7 MHz of real spectrum at coarse FFTs). Optional
-    # via the lo_null flag so the center can be revealed (LV-F8).
-    if lo_null and spg.shape[2] >= 3 and fft_nfft and sample_rate:
+    # Null the LO leakage region, sized to the configured striqt bandstop instead
+    # of a fixed ±2 bins (which hid up to ~3.7 MHz of real spectrum at coarse
+    # FFTs). Optional via the lo_null flag so the center can be revealed (LV-F8).
+    # With lo_bandstop None ("none" in the Analysis panel) there is no bandstop to
+    # size, so the display null is skipped too — the raw DC leak shows, honestly.
+    if lo_null and lo_bandstop and spg.shape[2] >= 3 and fft_nfft and sample_rate:
         step = max(1, bin_avg) * float(sample_rate) / float(fft_nfft)   # Hz per averaged bin
-        half = max(1, math.ceil((SSB_LO_BANDSTOP / 2) / step))
+        half = max(1, math.ceil((float(lo_bandstop) / 2) / step))
         c = spg.shape[-1] // 2
         lo = max(0, c - half)
         hi = min(spg.shape[-1], c + half + 1)
@@ -939,7 +1044,10 @@ def samples_needed(cfg: RadioConfig) -> int:
     if cfg.backend in {"calibrated", "ssb"}:
         # Overlapped STFT: only rows·hop + (nfft-hop) samples are needed to
         # produce cfg.rows display rows (LV-W2), not the full nfft·rows.
-        base = calibrated_sample_count(aligned_nfft(cfg.nfft), cfg.rows)
+        nfft = aligned_nfft(cfg.nfft)
+        base = calibrated_sample_count(
+            nfft, cfg.rows, analysis_hop(nfft, cfg.fractional_overlap)
+        )
     else:
         base = int(cfg.nfft * cfg.rows)
     if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate):
@@ -965,13 +1073,13 @@ def compute_blocks(samples: np.ndarray, cfg: RadioConfig):
         # SSB requires a sample rate on the 420 kHz grid; none of the selectable
         # rates qualify, so skip the striqt call (which would raise and fall back
         # every frame) and run calibrated directly, reporting it honestly (LV-F2).
-        blocks, meta = calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate, lo_null=cfg.lo_null)
+        blocks, meta = calibrated_spectrogram(samples, cfg)
         executed = "calibrated"
     elif requested == "calibrated":
-        blocks, meta = calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate, lo_null=cfg.lo_null)
+        blocks, meta = calibrated_spectrogram(samples, cfg)
         executed = "calibrated"
     elif requested == "ssb":
-        blocks, meta = ssb_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate, lo_null=cfg.lo_null)
+        blocks, meta = ssb_spectrogram(samples, cfg)
         executed = "ssb"
     else:
         blocks, meta = db_spectrogram(samples, cfg.nfft, cfg.rows)
@@ -995,14 +1103,20 @@ def build_header(cfg: RadioConfig, blocks: list, meta: dict, demo: bool = False)
     fft_nfft = int(meta.get("fft_nfft", bins)) or int(bins)
     bin_avg  = int(meta.get("bin_avg", 1)) or 1
 
-    # Frequency axis. Quicklook is a plain fftshifted FFT (bin 0 = -fs/2); the
-    # calibrated/ssb path DC-centers bin_avg-wide averaged groups, so their
-    # centers are symmetric about DC with step = bin_avg*fs/fft_nfft.
-    step = bin_avg * fs / fft_nfft
-    if executed == "quicklook":
-        f0 = -fs / 2.0
+    # Frequency axis. Prefer the exact coordinates striqt computed for the
+    # executed spec (calibrated path, P2a-1) — correct for any overlap/averaging/
+    # trim combination. Fallback: quicklook is a plain fftshifted FFT (bin 0 =
+    # -fs/2); the calibrated/ssb path DC-centers bin_avg-wide averaged groups, so
+    # their centers are symmetric about DC with step = bin_avg*fs/fft_nfft.
+    if meta.get("freqs_hz_f0") is not None and meta.get("freqs_hz_step") is not None:
+        f0   = float(meta["freqs_hz_f0"])
+        step = float(meta["freqs_hz_step"])
     else:
-        f0 = -(bins - 1) / 2.0 * step
+        step = bin_avg * fs / fft_nfft
+        if executed == "quicklook":
+            f0 = -fs / 2.0
+        else:
+            f0 = -(bins - 1) / 2.0 * step
 
     header = {
         "center":        float(cfg.center),
@@ -1017,6 +1131,10 @@ def build_header(cfg: RadioConfig, blocks: list, meta: dict, demo: bool = False)
         "bin_avg":       bin_avg,
         "freqs_hz_f0":   float(f0),
         "freqs_hz_step": float(step),
+        # Samples of signal one display row spans (additive, P2a-1). Lets the
+        # client label the time axis exactly for any fractional_overlap instead
+        # of assuming the 15/28 hop.
+        "hop_size":      int(meta.get("hop_size", fft_nfft) or fft_nfft),
         "time":          time.time(),
     }
     requested = str(meta.get("backend_requested", executed))

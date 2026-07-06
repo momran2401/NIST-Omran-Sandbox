@@ -473,3 +473,37 @@ meta `window/duration` label matches the selected value rather than clamping. Co
 `{rows:800}` request now yields 800-row frames (was capped at 300), and `{rows:99999}` is honestly
 clamped to the ring capacity (3686 rows at quicklook/nfft-1024), with `samples_needed < MAX_TAIL`
 for every backend/nfft.
+
+## Phase 2a — Analysis wiring + freedom model
+
+### P2a-1 — Parameterize the calibrated spectrogram from cfg (server plumbing)
+**Files:** `live/striqt_web_server.py`
+**Changed:** `calibrated_spectrogram` no longer hardcodes the striqt Spectrogram recipe. The
+seven analysis knobs now live in `RadioConfig` (immutable values, copied by `snapshot()`):
+`window` (scipy `get_window` spec, default `("kaiser", 11.88)`), `fractional_overlap`
+(`Fraction`, default `13/28`), `window_fill` (`Fraction`, default `15/28`),
+`integration_bandwidth` (`"auto"` = the old `frequency_resolution × averaging_factor(nfft)`
+coupling | `None` | Hz), `lo_bandstop` (`None` | Hz, default 120 kHz), `trim_stopband` (default
+False). `make_analysis_spec(cfg, nfft, fs)` builds the striqt spec;
+`calibrated_spectrogram`/`ssb_spectrogram` now take `(samples, cfg)`. `frequency_resolution`
+stays derived (`sample_rate / aligned_nfft(nfft)`) — **`cfg.nfft` is the single authoritative
+owner** of that quantity (the freq-res field arrives in P2a-2/6 as another view of it).
+The hop math is generalized: `analysis_hop(nfft, fractional_overlap)` computes
+`nfft − round(overlap·nfft)` exactly as striqt does, and `calibrated_sample_count`,
+`samples_needed`, `max_live_rows` and the new `row_hop(cfg)` all use it (no more hardwired
+15/28). The capture handed to striqt now carries the real `cfg.analysis_bandwidth` so
+`trim_stopband=True` has something to trim to (inert at the inf default). The display LO-null in
+`fit_display_rows` is sized to the configured `lo_bandstop` (skipped entirely when `None` — the
+DC leak then shows, honestly). **Header (additive only):** new `hop_size` field (samples per
+displayed row) so the client can label the time axis for any overlap; the calibrated path now
+ships striqt's own `spectrogram_freqs` coordinates as `freqs_hz_f0`/`freqs_hz_step` — exact for
+any trim/averaging combination. Note this corrects the old symmetric-about-DC approximation by
+half a raw FFT bin (~7.6 kHz at 15.36 MS/s / nfft 1008): striqt's averaged-group centers are the
+mean of the member bin frequencies, which is what the data actually represents.
+**Behaviour at defaults is unchanged** (verified: nfft 1008, bin_avg 12, hop 540, 83 bins, same
+units/attrs) apart from the half-bin axis correction above.
+
+**Verify [demo]:** frames on port 8001 (`--demo`, calibrated) still show `fft_nfft 1008 /
+bin_avg 12`, the same waterfall, and now include `hop_size: 540`; PSD tone positions unchanged
+(≤ half a raw bin shift from the axis correction). **Verify [hardware]:** live frames identical
+to pre-P2a at the default settings.
