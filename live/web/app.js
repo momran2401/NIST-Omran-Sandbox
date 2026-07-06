@@ -37,7 +37,8 @@ let analysisMode = "spectrogram";
 // Current frame metadata (updated on each frame)
 let curCenter   = 1955e6;
 let curFs       = 15.36e6;
-let curNfft     = 1024;
+let radioNfft   = 1024;     // requested radio FFT size (from #nfft-sel); NEVER set from frame headers
+let curBins     = 1024;     // bins in the current frame's blocks (from header "nfft")
 let curRows     = 12;
 let curBackend  = "calibrated";
 let freqsMHz    = null;     // Float32Array(nfft)
@@ -96,16 +97,16 @@ function setStatus(text, cls = "") {
 }
 
 function updateMeta() {
-    if (!curNfft || !curFs) return;
-    const depthRows = wfBuf[0] ? wfBuf[0].length / curNfft : curRows;
-    const winMs     = (depthRows * curNfft / curFs * 1e3).toFixed(0);
+    if (!curBins || !curFs) return;
+    const depthRows = wfBuf[0] ? wfBuf[0].length / curBins : curRows;
+    const winMs     = (depthRows * radioNfft * backendHopFrac() / curFs * 1e3).toFixed(0);
     const mode      = replaceMode ? "flicker" : "waterfall";
     const scale     = autoColor ? "auto" : "manual";
     const analysis  = analysisMode === "ssb" ? "SSB" : (analysisMode === "psd" ? "PSD" : curBackend);
     metaEl.textContent = (
         `LIVE | center ${(curCenter / 1e6).toFixed(3)} MHz | ` +
         `span ${(curFs / 1e6).toFixed(2)} MS/s | ` +
-        `FFT ${curNfft} | ${analysis} | ${mode} | window ${winMs} ms (${depthRows} rows) | ` +
+        `FFT ${curBins} | ${analysis} | ${mode} | window ${winMs} ms (${depthRows} rows) | ` +
         `scale ${scale} [${levels[0].toFixed(0)}, ${levels[1].toFixed(0)}] | ` +
         `${absRF ? "absolute RF" : "baseband"} | ${renderedFps.toFixed(0)} fps`
     );
@@ -125,8 +126,18 @@ function buildFreqsMHz(center, fs, nfft, absoluteRF) {
     return f;
 }
 
-function rowsForWindow(fs, nfft, windowMs) {
-    return Math.max(1, Math.min(Math.round(windowMs / 1000 * fs / nfft), 300));
+// Hop fraction of the radio FFT size between successive STFT rows. Quicklook
+// takes non-overlapping full-length FFTs (hop = nfft); the calibrated/ssb striqt
+// path uses window_fill = 15/28, so the hop is nfft·15/28 (finer time spacing).
+function backendHopFrac() {
+    return curBackend === "quicklook" ? 1 : 15 / 28;
+}
+
+// Rows the display window spans. windowMs of signal advances by (radioNfft·hopFrac)
+// samples per STFT row, so rows = windowMs·fs / (radioNfft·hopFrac). Uses the
+// requested radio FFT size, NOT the per-frame averaged bin count.
+function rowsForWindow(fs, radioNfft, windowMs, hopFrac) {
+    return Math.max(1, Math.min(Math.round(windowMs / 1000 * fs / (radioNfft * hopFrac)), 300));
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +153,7 @@ function connect() {
         setStatus("connected", "ok");
         logMsg("WebSocket connected");
         // Tell the server our initial window size
-        sendControl({ rows: rowsForWindow(curFs, curNfft, windowMs) });
+        sendControl({ rows: rowsForWindow(curFs, radioNfft, windowMs, backendHopFrac()) });
     };
 
     ws.onmessage = (e) => {
@@ -207,11 +218,11 @@ function onFrame(data) {
 
     // ── Update state when tuning changes ──────────────────────────────────
     const tuningChanged = (
-        nfft !== curNfft || center !== curCenter || fs !== curFs
+        nfft !== curBins || center !== curCenter || fs !== curFs
     );
     curBackend = backend || curBackend;
     if (tuningChanged) {
-        curNfft   = nfft;
+        curBins   = nfft;
         curCenter = center;
         curFs     = fs;
         freqsMHz  = buildFreqsMHz(center, fs, nfft, absRF);
@@ -257,7 +268,7 @@ const wfImageData = { 0: null, 1: null };
 
 function computeDisplayDepth(rows, nfft, fs) {
     if (replaceMode) return rows;
-    return rowsForWindow(fs, nfft, windowMs);
+    return rowsForWindow(fs, radioNfft, windowMs, backendHopFrac());
 }
 
 function updateWaterfall(ch, block, rows, nfft, center, fs) {
@@ -779,7 +790,7 @@ function exportPng() {
 
     // Settings caption
     const ts  = new Date().toLocaleString();
-    const cap = `${ts}  center ${(curCenter / 1e6).toFixed(3)} MHz  span ${(curFs / 1e6).toFixed(2)} MS/s  FFT ${curNfft}`;
+    const cap = `${ts}  center ${(curCenter / 1e6).toFixed(3)} MHz  span ${(curFs / 1e6).toFixed(2)} MS/s  FFT ${curBins}`;
     ctx.fillStyle = "#d0d0d0";
     ctx.font      = "11px Menlo,monospace";
     ctx.fillText(cap, 10, H - 8);
@@ -807,7 +818,7 @@ resizeObserver.observe(document.getElementById("psd-container"));
 // ---------------------------------------------------------------------------
 
 function rowsForCurrentSettings() {
-    return rowsForWindow(curFs, curNfft, windowMs);
+    return rowsForWindow(curFs, radioNfft, windowMs, backendHopFrac());
 }
 
 function applyAnalysisMode() {
@@ -832,7 +843,7 @@ document.getElementById("center-mhz").addEventListener("keydown", (e) => {
 document.getElementById("rate-sel").addEventListener("change", (e) => {
     const fs   = parseFloat(e.target.value) * 1e6;
     const ctrl = { sample_rate: fs };
-    if (replaceMode) ctrl.rows = rowsForWindow(fs, curNfft, windowMs);
+    if (replaceMode) ctrl.rows = rowsForWindow(fs, radioNfft, windowMs, backendHopFrac());
     sendControl(ctrl);
 });
 
@@ -846,8 +857,9 @@ document.getElementById("gain").addEventListener("keydown", (e) => {
 
 document.getElementById("nfft-sel").addEventListener("change", (e) => {
     const nfft = parseInt(e.target.value, 10);
+    radioNfft = nfft;   // the ONLY place radioNfft is updated
     const ctrl = { nfft };
-    if (replaceMode) ctrl.rows = rowsForWindow(curFs, nfft, windowMs);
+    if (replaceMode) ctrl.rows = rowsForWindow(curFs, radioNfft, windowMs, backendHopFrac());
     sendControl(ctrl);
 });
 
@@ -892,7 +904,7 @@ document.getElementById("auto-color").addEventListener("change", (e) => {
 
 document.getElementById("abs-rf").addEventListener("change", (e) => {
     absRF    = e.target.checked;
-    freqsMHz = buildFreqsMHz(curCenter, curFs, curNfft, absRF);
+    freqsMHz = buildFreqsMHz(curCenter, curFs, curBins, absRF);
     if (uplot && freqsMHz) initUplot(freqsMHz);
     resetBand(freqsMHz);
 });
@@ -1106,7 +1118,7 @@ bandLo = -curFs / 1e6 * 0.05;
 bandHi =  curFs / 1e6 * 0.05;
 
 // Init PSD with placeholder data so layout is in place
-freqsMHz = buildFreqsMHz(curCenter, curFs, curNfft, absRF);
+freqsMHz = buildFreqsMHz(curCenter, curFs, curBins, absRF);
 initUplot(freqsMHz);
 
 connect();
