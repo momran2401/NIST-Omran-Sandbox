@@ -796,3 +796,26 @@ duration 40 ms yields 112 rows (2 bursts); live SCS 15 kHz reshapes to rows 28/b
 max_block_count caps the frame. **Verify [hardware]:** the radio arms 13.44 MS/s; with a live
 n41 SSB the burst view shows the 4-column SSB symbol structure; discovery 20 ms lines bursts
 up frame-to-frame; deliberately-bad params report and never kill the feed.
+
+### P2b-6 — Per-analysis panels: the Analysis column follows the selected analysis
+**Files:** `live/web/index.html`, `live/web/app.js`
+**Changed:** The DAN-mode Analysis column (inside the pro-only `#settings-panel`; ARIC never
+sees it) is now rendered dynamically from an `ANALYSIS_PANELS` descriptor table instead of a
+fixed field list, and **switching the Analysis dropdown swaps which parameter set is
+editable** — matching the intent that the config targets the shown analysis. Spectrogram
+shows the P2a set + `time aperture (s)`; PSD shows the shared STFT fields + `time statistics`
+("mean, 0.95, max" style); SSB shows `subcarrier spacing / SSB output rate / discovery period
+/ frequency offset / max burst sets / window / LO bandstop`; Quicklook states it has no
+analysis parameters (Apply hidden). Apply sends `{"analysis": {"target": <shown>, …}}` with
+only the non-empty fields; each panel seeds from its own `/config` block (`analysis`,
+`analysis_psd`, `analysis_ssb`) on render, on load, and after every ack (the cached config
+re-seeds instantly on panel switches). The badge line names the target and its caveat (e.g.
+the SSB retune). Free-text inputs remain by design — all legality still lives in the server's
+freedom model.
+
+**Verify [demo]:** in DAN mode the panel renders the spectrogram set by default; selecting
+PSD/SSB/Quicklook swaps the fields (and badge) and a bare Apply on each target returns
+`applied []`; editing `time statistics` changes which PSD traces draw; editing SSB
+`subcarrier spacing` reshapes the burst view; all panels re-seed to the server's executed
+values after a rounded ack. ARIC mode shows no panel. **Verify [hardware]:** none beyond the
+P2b-2/3/5 server items (pure UI routing).

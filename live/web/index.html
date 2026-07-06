@@ -152,38 +152,18 @@
             <h3>Source <span class="reconnect-badge">requires reconnect — not applied live</span></h3>
             <div id="source-settings-form" class="settings-grid"></div>
         </div>
-        <!-- Analysis (P2a-6): the striqt Spectrogram recipe, DAN-mode only (the
-             whole #settings-panel is pro-only). Free-text inputs by design —
+        <!-- Analysis (P2a-6, per-analysis panels P2b-6): DAN-mode only (the
+             whole #settings-panel is pro-only). The fields are rendered by
+             app.js for the analysis currently selected in the Analysis
+             dropdown (spectrogram / PSD / SSB), matching the intent that the
+             config targets the shown analysis. Free-text inputs by design —
              the freedom model on the server snaps knowable constraints
              (reported as "invalid X → using Y") and scratch-validates the rest
              with striqt before the live stream ever sees a new value. Values
              seed from /config, so Apply re-sends only what you actually edit. -->
         <div class="settings-col" id="analysis-col">
-            <h3>Analysis <span class="analysis-badge">calibrated spectrogram — validated before going live</span></h3>
-            <div id="analysis-form" class="settings-grid settings-static">
-                <label title="scipy get_window spec: a name (hann, blackmanharris, …) or name, parameter (kaiser, 11.88)">window
-                    <input type="text" id="an-window" placeholder="kaiser, 11.88">
-                </label>
-                <label title="Hz per FFT bin — the other view of FFT size; snaps to the nearest legal FFT size">frequency resolution (Hz)
-                    <input type="text" id="an-freqres" placeholder="15238.1">
-                </label>
-                <label title="fraction of each FFT window shared with its neighbor, e.g. 13/28 or 0.46; snaps to k/nfft">fractional overlap
-                    <input type="text" id="an-overlap" placeholder="13/28">
-                </label>
-                <label title="fraction of the window filled by the taper (rest zeroed), e.g. 15/28; snaps to k/nfft">window fill
-                    <input type="text" id="an-fill" placeholder="15/28">
-                </label>
-                <label title="RMS frequency-bin averaging width: auto (tracks FFT size), none, or Hz (snaps to a multiple of the resolution)">integration bandwidth (Hz)
-                    <input type="text" id="an-integ" placeholder="auto | none | Hz">
-                </label>
-                <label title="width nulled at DC by striqt: none, or Hz">LO bandstop (Hz)
-                    <input type="text" id="an-lobandstop" placeholder="none | Hz">
-                </label>
-                <label title="binned RMS averaging along the time axis: none, or seconds (snaps to a multiple of the row hop)">time aperture (s)
-                    <input type="text" id="an-aperture" placeholder="none | s">
-                </label>
-                <label class="check" title="trim the frequency axis to the capture analysis_bandwidth (needs a finite analysis_bandwidth)"><input type="checkbox" id="an-trim"> trim stopband</label>
-            </div>
+            <h3>Analysis <span class="analysis-badge" id="analysis-badge"></span></h3>
+            <div id="analysis-form" class="settings-grid settings-static"></div>
             <button id="analysis-apply" type="button">Apply analysis</button>
         </div>
     </div>

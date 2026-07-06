@@ -1232,6 +1232,8 @@ function applyAnalysisMode() {
     holdBuf[0] = holdBuf[1] = null;
     minBuf[0] = minBuf[1] = null;
     sendControl({ backend });
+    // Swap the Analysis panel to the selected analysis' parameter set (P2b-6).
+    if (typeof renderAnalysisPanel === "function") renderAnalysisPanel();
     updateMeta();
 }
 
@@ -1618,58 +1620,154 @@ document.getElementById("settings-upload").addEventListener("change", async (e) 
 });
 
 // ---------------------------------------------------------------------------
-// Analysis panel (P2a-6) — DAN-mode editors for the striqt Spectrogram params
+// Analysis panel (P2a-6, per-analysis P2b-6) — DAN-mode editors for the striqt
+// analysis params. The rendered field set follows the Analysis dropdown
+// (spectrogram / PSD / SSB), so the config always targets the shown analysis.
 // ---------------------------------------------------------------------------
 //
-// Free-text by design (the freedom model): values are sent raw and the SERVER
-// snaps knowable constraints ("invalid X → using Y" via handleAck) or lets
-// striqt scratch-validate the rest before the live stream sees anything. The
-// fields seed from /config and re-seed after every ack, so what the panel
-// shows is always what the server actually runs.
+// Free-text by design (the freedom model): values are sent raw as
+// {"analysis": {"target": …, …}} and the SERVER snaps knowable constraints
+// ("invalid X → using Y" via handleAck) or lets striqt scratch-validate the
+// rest before the live stream sees anything. Fields seed from /config and
+// re-seed after every ack, so the panel always shows what the server runs.
 
-const ANALYSIS_FIELDS = [
-    { id: "an-window",     key: "window" },
-    { id: "an-freqres",    key: "frequency_resolution" },
-    { id: "an-overlap",    key: "fractional_overlap" },
-    { id: "an-fill",       key: "window_fill" },
-    { id: "an-integ",      key: "integration_bandwidth" },
-    { id: "an-lobandstop", key: "lo_bandstop" },
-    { id: "an-aperture",   key: "time_aperture" },
-    { id: "an-trim",       key: "trim_stopband", checkbox: true },
+const SHARED_FREQ_FIELDS = [
+    { key: "window", label: "window", ph: "kaiser, 11.88",
+      title: "scipy get_window spec: a name (hann, blackmanharris, …) or name, parameter (kaiser, 11.88)" },
+    { key: "frequency_resolution", label: "frequency resolution (Hz)", ph: "15238.1",
+      title: "Hz per FFT bin — the other view of FFT size; snaps to the nearest legal FFT size" },
+    { key: "fractional_overlap", label: "fractional overlap", ph: "13/28",
+      title: "fraction of each FFT window shared with its neighbor, e.g. 13/28 or 0.46; snaps to k/nfft" },
+    { key: "window_fill", label: "window fill", ph: "15/28",
+      title: "fraction of the window filled by the taper (rest zeroed), e.g. 15/28; snaps to k/nfft" },
+    { key: "integration_bandwidth", label: "integration bandwidth (Hz)", ph: "auto | none | Hz",
+      title: "RMS frequency-bin averaging width: auto (tracks FFT size), none, or Hz (snaps to a multiple of the resolution)" },
+    { key: "lo_bandstop", label: "LO bandstop (Hz)", ph: "none | Hz",
+      title: "width nulled at DC by striqt: none, or Hz" },
 ];
+const TRIM_FIELD = {
+    key: "trim_stopband", label: "trim stopband", checkbox: true,
+    title: "trim the frequency axis to the capture analysis_bandwidth (needs a finite analysis_bandwidth)",
+};
+
+const ANALYSIS_PANELS = {
+    spectrogram: {
+        target: "spectrogram", configKey: "analysis",
+        badge: "calibrated spectrogram — validated before going live",
+        fields: [
+            ...SHARED_FREQ_FIELDS,
+            { key: "time_aperture", label: "time aperture (s)", ph: "none | s",
+              title: "binned RMS averaging along the time axis: none, or seconds (snaps to a multiple of the row hop)" },
+            TRIM_FIELD,
+        ],
+    },
+    psd: {
+        target: "psd", configKey: "analysis_psd",
+        badge: "striqt power_spectral_density — one trace per statistic",
+        fields: [
+            ...SHARED_FREQ_FIELDS,
+            { key: "time_statistic", label: "time statistics", ph: "mean, 0.95, max",
+              title: "statistics evaluated along the time axis — names (mean/max/min/rms/median) and/or quantiles in [0,1]; one PSD trace each" },
+            TRIM_FIELD,
+        ],
+    },
+    ssb: {
+        target: "ssb", configKey: "analysis_ssb",
+        badge: "5G SSB burst view — may retune the capture rate onto the symbol grid",
+        fields: [
+            { key: "subcarrier_spacing", label: "subcarrier spacing (Hz)", ph: "30000",
+              title: "3GPP SCS (15000/30000/60000 …); selecting SSB retunes the capture rate onto the 14·scs grid (reported)" },
+            { key: "sample_rate", label: "SSB output rate (S/s)", ph: "7680000",
+              title: "output rate of the recentered SSB band; cannot exceed the sampled span" },
+            { key: "discovery_periodicity", label: "discovery period (s)", ph: "0.02",
+              title: "time between synchronization bursts; ≥ one 2 ms burst set and one period must fit the IQ ring" },
+            { key: "frequency_offset", label: "frequency offset (Hz)", ph: "0",
+              title: "SSB center offset from the capture center; snaps to the subcarrier grid and must keep the band in the span" },
+            { key: "max_block_count", label: "max burst sets", ph: "none | count",
+              title: "cap on synchronization bursts evaluated per frame, or none" },
+            { key: "window", label: "window", ph: "blackmanharris",
+              title: "scipy get_window spec for the SSB STFT" },
+            { key: "lo_bandstop", label: "LO bandstop (Hz)", ph: "none | Hz",
+              title: "width nulled at DC by striqt: none, or Hz" },
+        ],
+    },
+    quicklook: {
+        target: null, configKey: null,
+        badge: "raw per-bin FFT — no analysis parameters",
+        fields: [],
+    },
+};
+
+let lastConfig = null;      // latest /config payload — seeds panel switches
+let renderedPanel = null;   // key into ANALYSIS_PANELS currently in the DOM
+
+function analysisFieldValue(v) {
+    if (v === null || v === undefined) return "none";
+    if (Array.isArray(v)) return v.join(", ");   // ["kaiser", 11.88] → "kaiser, 11.88"
+    return String(v);
+}
+
+function renderAnalysisPanel() {
+    const key = ANALYSIS_PANELS[analysisMode] ? analysisMode : "spectrogram";
+    const panel = ANALYSIS_PANELS[key];
+    const form  = document.getElementById("analysis-form");
+    const badge = document.getElementById("analysis-badge");
+    const apply = document.getElementById("analysis-apply");
+    if (!form) return;
+    renderedPanel = key;
+    if (badge) badge.textContent = panel.badge;
+    if (apply) apply.style.display = panel.fields.length ? "" : "none";
+    form.textContent = "";
+    for (const f of panel.fields) {
+        const label = document.createElement("label");
+        if (f.title) label.title = f.title;
+        const input = document.createElement("input");
+        input.dataset.key = f.key;
+        if (f.checkbox) {
+            label.className = "check";
+            input.type = "checkbox";
+            label.appendChild(input);
+            label.appendChild(document.createTextNode(" " + f.label));
+        } else {
+            label.textContent = f.label;
+            input.type = "text";
+            input.placeholder = f.ph || "";
+            label.appendChild(input);
+        }
+        form.appendChild(label);
+    }
+    seedAnalysisForm(lastConfig);
+}
 
 function seedAnalysisForm(config) {
-    const an = (config && config.analysis) || {};
-    for (const f of ANALYSIS_FIELDS) {
-        const el = document.getElementById(f.id);
-        if (!el || !(f.key in an)) continue;
-        const v = an[f.key];
-        if (f.checkbox) {
-            el.checked = Boolean(v);
-        } else if (Array.isArray(v)) {
-            el.value = v.join(", ");            // ["kaiser", 11.88] → "kaiser, 11.88"
-        } else if (v === null || v === undefined) {
-            el.value = "none";
-        } else {
-            el.value = String(v);
-        }
-    }
+    if (config) lastConfig = config;
+    const panel = ANALYSIS_PANELS[renderedPanel];
+    if (!panel || !panel.configKey || !lastConfig) return;
+    const an = lastConfig[panel.configKey] || {};
+    document.querySelectorAll("#analysis-form input").forEach((el) => {
+        const key = el.dataset.key;
+        if (!(key in an)) return;
+        if (el.type === "checkbox") el.checked = Boolean(an[key]);
+        else el.value = analysisFieldValue(an[key]);
+    });
 }
 
 document.getElementById("analysis-apply").addEventListener("click", () => {
-    const analysis = {};
-    for (const f of ANALYSIS_FIELDS) {
-        const el = document.getElementById(f.id);
-        if (!el) continue;
-        if (f.checkbox) {
-            analysis[f.key] = el.checked;
-        } else if (el.value.trim() !== "") {    // cleared fields are not sent
-            analysis[f.key] = el.value.trim();
+    const panel = ANALYSIS_PANELS[renderedPanel];
+    if (!panel || !panel.target) return;
+    const analysis = { target: panel.target };
+    document.querySelectorAll("#analysis-form input").forEach((el) => {
+        if (el.type === "checkbox") {
+            analysis[el.dataset.key] = el.checked;
+        } else if (el.value.trim() !== "") {   // cleared fields are not sent
+            analysis[el.dataset.key] = el.value.trim();
         }
-    }
+    });
     sendControl({ analysis });
-    logMsg("Analysis settings sent");
+    logMsg(`Analysis settings sent (${panel.target})`);
 });
+
+renderAnalysisPanel();
 
 // ---------------------------------------------------------------------------
 // Bootstrap
