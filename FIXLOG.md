@@ -269,3 +269,13 @@ is fully eliminated.
 **Verify [hardware]:** not reproducible in `--demo` (no ring). On hardware, rapid center changes —
 the waterfall must never flash dark rows nor show the previous band's energy under the new center
 label.
+
+### LV-R6 — Band monitor: replace `mask.includes()` scan with an index range
+**File:** `live/web/app.js`
+**Changed:** `updateBandMonitor` built an in-band index array and tested `mask.includes(i)` inside
+the per-row/per-bin loop — O(rows·nfft·bins), ~5·10⁸ ops/frame at nfft 4096 → tab freeze. Since
+`freqsMHz` is sorted ascending, it now computes `loIdx`/`hiIdx` once and uses an O(1) index-range
+test; `nBins = hiIdx-loIdx+1`. Output strings unchanged.
+
+**Verify [demo]:** switch to Quicklook at FFT 4096 with a 300-row window and drag the band — the
+page stays at full fps (`performance.now()` delta around the call < 5 ms).

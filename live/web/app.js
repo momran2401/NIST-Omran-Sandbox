@@ -716,15 +716,17 @@ function updateBandMonitor(channels, blocks, rows, nfft) {
     const lo = Math.min(bandLo, bandHi);
     const hi = Math.max(bandLo, bandHi);
 
-    // Gather in-band frequency indices
-    const mask = [];
-    for (let i = 0; i < nfft; i++) {
-        if (freqsMHz[i] >= lo && freqsMHz[i] <= hi) mask.push(i);
-    }
-    if (mask.length === 0) {
+    // freqsMHz is sorted ascending — find the in-band index range once, instead of
+    // an O(rows·nfft·bins) mask.includes() scan that froze at nfft 4096 (LV-R6).
+    let loIdx = 0;
+    while (loIdx < nfft && freqsMHz[loIdx] < lo) loIdx++;
+    let hiIdx = nfft - 1;
+    while (hiIdx >= 0 && freqsMHz[hiIdx] > hi) hiIdx--;
+    if (loIdx > hiIdx) {
         bandMonitorEl.textContent = `Band ${lo.toFixed(3)}–${hi.toFixed(3)} MHz: no bins`;
         return;
     }
+    const nBins = hiIdx - loIdx + 1;
 
     const band = {}, qual = {};
     for (const ch of [0, 1]) {
@@ -739,17 +741,17 @@ function updateBandMonitor(channels, blocks, rows, nfft) {
             for (let i = 0; i < nfft; i++) {
                 const lin = Math.pow(10, buf[off + i] / 10);
                 sumAll += lin;
-                if (mask.includes(i)) sumInBand += lin;
+                if (i >= loIdx && i <= hiIdx) sumInBand += lin;
             }
         }
-        const linBand = sumInBand / (mask.length * depth);
+        const linBand = sumInBand / (nBins * depth);
         const linAll  = sumAll    / (nfft        * depth);
         band[ch] = 10 * Math.log10(Math.max(linBand, 1e-20));
         qual[ch] = 10 * Math.log10(Math.max(linBand, 1e-20))
                  - 10 * Math.log10(Math.max(linAll,  1e-20));
     }
 
-    const segs = [`Band ${lo.toFixed(3)}–${hi.toFixed(3)} MHz (${mask.length} bins)`];
+    const segs = [`Band ${lo.toFixed(3)}–${hi.toFixed(3)} MHz (${nBins} bins)`];
     if (band[0] !== undefined) segs.push(`RX1 ${band[0].toFixed(1)} dB`);
     if (band[1] !== undefined) segs.push(`RX2 ${band[1].toFixed(1)} dB`);
     if (band[0] !== undefined && band[1] !== undefined) {
