@@ -120,6 +120,7 @@ function updateMeta() {
         `scale ${scale} [${levels[0].toFixed(0)}, ${levels[1].toFixed(0)}] | ` +
         `${absRF ? "absolute RF" : "baseband"} | ${renderedFps.toFixed(0)} fps`
     );
+    renderWfAxis();
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +384,24 @@ function updateWaterfall(ch, block, rows, nfft, center, fs) {
         imgData[i * 4 + 3] = 255;
     }
     wfCtx[ch].putImageData(wfImageData[ch], 0, 0);
+}
+
+// Populate the waterfall frequency-axis overlays (LV-F7). Five evenly spaced
+// ticks from the true axis (LV-F1) plus the current hop-aware window on the right.
+function renderWfAxis() {
+    if (!freqsMHz || !freqsMHz.length) return;
+    const divs = document.querySelectorAll(".wf-freq-axis");
+    if (!divs.length) return;
+    const n = freqsMHz.length;
+    let spans = "";
+    for (let k = 0; k < 5; k++) {
+        const i = Math.round((k / 4) * (n - 1));
+        spans += `<span>${freqsMHz[i].toFixed(1)} MHz</span>`;
+    }
+    const depthRows = wfBuf[0] ? wfBuf[0].length / curBins : curRows;
+    const winMs = (depthRows * radioNfft * backendHopFrac() / curFs * 1e3).toFixed(0);
+    spans += `<span class="wf-axis-win">↕ ${winMs} ms</span>`;
+    divs.forEach((d) => { d.innerHTML = spans; });
 }
 
 // ---------------------------------------------------------------------------
@@ -990,6 +1009,7 @@ document.getElementById("abs-rf").addEventListener("change", (e) => {
     freqsMHz = buildFreqsMHz(curCenter, curFs, curBins, absRF, curF0, curStep);
     if (uplot && freqsMHz) initUplot(freqsMHz);
     resetBand(freqsMHz);
+    renderWfAxis();
 });
 
 document.getElementById("reset-btn").addEventListener("click", () => {

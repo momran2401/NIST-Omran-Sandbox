@@ -161,3 +161,15 @@ compute correctly on a representative payload.
 so any valid sweep JSON with a `center_frequency` works) via Load JSON, press Apply, and check the
 browser Log panel lists the three categories (applied/ignored/reconnect-only) and the radio
 retunes to the file's `center_frequency`.
+
+### LV-F7 — Populate the waterfall frequency axis (empty `.wf-freq-axis` overlay)
+**Files:** `live/web/app.js`, `live/web/style.css`
+**Changed:** The `.wf-freq-axis` overlay divs were styled but never populated. Added
+`renderWfAxis()` which fills both divs with 5 evenly spaced ticks from the true axis
+(`freqsMHz`, LV-F1) as `<span>` elements plus a right-aligned `↕ N ms` span for the current
+hop-aware window (LV-W1). Called from the end of `updateMeta` (every frame, after `wfBuf` is
+current) and from the Absolute-RF handler. Styled `.wf-freq-axis` as a `space-between` flex row
+with a text-shadow for legibility over the waterfall (window span highlighted).
+
+**Verify [demo]:** labels appear under each waterfall and match the uPlot PSD x-axis extremes;
+changing center/span/Absolute-RF updates them.
