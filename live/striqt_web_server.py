@@ -820,13 +820,24 @@ def compute_blocks(samples: np.ndarray, cfg: RadioConfig):
     the per-frame axis parameters (fft_nfft, bin_avg) and the executed backend,
     used by build_header to ship an honest frame header (LV-F1/F2).
     """
-    if cfg.backend == "calibrated":
+    requested = cfg.backend
+    if requested == "ssb" and not ssb_grid_compatible(cfg.sample_rate):
+        # SSB requires a sample rate on the 420 kHz grid; none of the selectable
+        # rates qualify, so skip the striqt call (which would raise and fall back
+        # every frame) and run calibrated directly, reporting it honestly (LV-F2).
         blocks, meta = calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
-    elif cfg.backend == "ssb":
+        executed = "calibrated"
+    elif requested == "calibrated":
+        blocks, meta = calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
+        executed = "calibrated"
+    elif requested == "ssb":
         blocks, meta = ssb_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
+        executed = "ssb"
     else:
         blocks, meta = db_spectrogram(samples, cfg.nfft, cfg.rows)
-    meta.setdefault("backend", cfg.backend)
+        executed = "quicklook"
+    meta["backend"] = executed
+    meta["backend_requested"] = requested
     return blocks, meta
 
 

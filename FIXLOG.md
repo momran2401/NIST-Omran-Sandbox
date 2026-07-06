@@ -86,3 +86,22 @@ to the old formula (stays exact).
 calibrated peak marker read ≈ 2.45 MHz offset; after, 2.5 MHz ± ½ step. Browser console: the
 DC bin `freqsMHz[(curBins-1)/2]*1e6 - curCenter` must be ~0 in calibrated mode (with LV-W3's
 83-bin grid the DC bin is index 41); quicklook stays exact.
+
+### LV-F2 — Honest backend reporting (SSB fallback flag; disable SSB at incompatible rates)
+**Files:** `live/striqt_web_server.py`, `live/web/app.js`
+**Changed:** `compute_blocks` now pre-checks `ssb_grid_compatible(cfg.sample_rate)` when the
+requested backend is `ssb`; when false it skips the doomed striqt call (which used to raise +
+fall back every frame) and runs calibrated directly, recording `meta["backend"]="calibrated"`
+and `meta["backend_requested"]="ssb"`. `build_header` (from LV-F1) already emits
+`backend_requested` only when it differs from the executed `backend`. Client: `onFrame` warns
+once per change (`setStatus(..., "warn")` + log) when `backend !== backend_requested`; the meta
+"analysis" field now renders the executed `curBackend` (was the lying dropdown value); added
+`ssbGridCompatible(fs)` (mirrors the server test) + `updateSsbOption()` which disables the SSB
+`<option>` with a 420 kHz-grid tooltip when the current rate can't deliver it (called on tuning
+change and at bootstrap). Confirmed locally: all four selectable rates (3.84/7.68/15.36/30.72)
+are incompatible → SSB disabled + fallback reported; the 420 kHz rates (15.12/30.24) would be
+compatible but aren't selectable.
+
+**Verify [demo]:** `--demo --backend ssb`: header decodes to `backend:"calibrated"` with
+`backend_requested:"ssb"`, the meta shows `calibrated` + a warning status line; switching rates
+keeps it consistent; no striqt `ValueError` spam in the server output.

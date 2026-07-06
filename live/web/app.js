@@ -44,6 +44,7 @@ let curBackend  = "calibrated";
 let freqsMHz    = null;     // Float32Array(nfft)
 let curF0       = null;     // header freqs_hz_f0 (true axis origin, Hz baseband)
 let curStep     = null;     // header freqs_hz_step (true bin spacing, Hz)
+let lastBackendWarn = null; // dedups the "SSB unavailable" status warning
 let levels      = [-90, -10];
 
 // Per-channel display buffers [rows_displayed × nfft], newest row at index 0
@@ -104,7 +105,7 @@ function updateMeta() {
     const winMs     = (depthRows * radioNfft * backendHopFrac() / curFs * 1e3).toFixed(0);
     const mode      = replaceMode ? "flicker" : "waterfall";
     const scale     = autoColor ? "auto" : "manual";
-    const analysis  = analysisMode === "ssb" ? "SSB" : (analysisMode === "psd" ? "PSD" : curBackend);
+    const analysis  = curBackend;   // executed backend from the header (honest — LV-F2)
     metaEl.textContent = (
         `LIVE | center ${(curCenter / 1e6).toFixed(3)} MHz | ` +
         `span ${(curFs / 1e6).toFixed(2)} MS/s | ` +
@@ -149,6 +150,23 @@ function backendHopFrac() {
 // requested radio FFT size, NOT the per-frame averaged bin count.
 function rowsForWindow(fs, radioNfft, windowMs, hopFrac) {
     return Math.max(1, Math.min(Math.round(windowMs / 1000 * fs / (radioNfft * hopFrac)), 300));
+}
+
+// Mirror of the server's ssb_grid_compatible: the true SSB path needs the sample
+// rate on a 420 kHz grid (13·nfft divisible by 28, nfft = round(2·fs/30 kHz)).
+function ssbGridCompatible(fs) {
+    const nfft = Math.round(2 * fs / 30e3);
+    return nfft > 0 && (13 * nfft) % 28 === 0;
+}
+
+// Disable the SSB analysis option when the current rate can't deliver it, so the
+// UI never offers what the stack silently falls back from (LV-F2).
+function updateSsbOption() {
+    const opt = document.querySelector('#analysis-sel option[value="ssb"]');
+    if (!opt) return;
+    const ok = ssbGridCompatible(curFs);
+    opt.disabled = !ok;
+    opt.title = ok ? "" : "SSB needs a sample rate on the 420 kHz grid — none of the LTE rates qualify";
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +223,7 @@ function onFrame(data) {
     const header  = JSON.parse(hdrText);
 
     const { nfft, rows, channels, center, fs, gain, dtype, scale, backend,
-            freqs_hz_f0, freqs_hz_step } = header;
+            backend_requested, freqs_hz_f0, freqs_hz_step } = header;
     let offset = 4 + hdrLen;
 
     // ── Parse blocks ──────────────────────────────────────────────────────
@@ -235,6 +253,21 @@ function onFrame(data) {
         nfft !== curBins || center !== curCenter || fs !== curFs || stepVal !== curStep
     );
     curBackend = backend || curBackend;
+
+    // Honest backend reporting: warn once when the server had to substitute a
+    // backend (e.g. SSB is unavailable at this sample rate) — LV-F2.
+    if (backend_requested && backend && backend !== backend_requested) {
+        const key = `${backend_requested}->${backend}`;
+        if (lastBackendWarn !== key) {
+            lastBackendWarn = key;
+            setStatus(`${backend_requested.toUpperCase()} unavailable at this rate — showing ${backend}`, "warn");
+            logMsg(`${backend_requested} unavailable at ${(fs / 1e6).toFixed(2)} MS/s — showing ${backend}`, "WARN");
+        }
+    } else if (lastBackendWarn !== null) {
+        lastBackendWarn = null;
+        setStatus("connected", "ok");
+    }
+
     if (tuningChanged) {
         curBins   = nfft;
         curCenter = center;
@@ -242,6 +275,7 @@ function onFrame(data) {
         curF0     = f0Val;
         curStep   = stepVal;
         freqsMHz  = buildFreqsMHz(center, fs, nfft, absRF, curF0, curStep);
+        updateSsbOption();
         // Clear hold/min on tuning change (freq-axis specific)
         holdBuf[0] = holdBuf[1] = null;
         minBuf[0]  = minBuf[1]  = null;
@@ -1136,6 +1170,7 @@ bandHi =  curFs / 1e6 * 0.05;
 // Init PSD with placeholder data so layout is in place
 freqsMHz = buildFreqsMHz(curCenter, curFs, curBins, absRF, curF0, curStep);
 initUplot(freqsMHz);
+updateSsbOption();
 
 connect();
 loadSchema().catch((err) => logMsg(`Schema load failed: ${err.message}`, "ERROR"));
