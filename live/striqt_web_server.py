@@ -160,11 +160,16 @@ def _snap(value, choices):
 
 WEB_DIR = Path(__file__).parent / "web"
 
-# Backend: "calibrated" (striqt PSD/ENBW dB) or "quicklook" (simple FFT dB)
+# Backend: "calibrated" (striqt PSD/ENBW dB spectrogram), "quicklook" (simple
+# FFT dB), "psd" (striqt power_spectral_density statistic traces, P2b-3), or
+# "ssb" (striqt 5G SSB spectrogram).
 SPEC_BACKEND = os.environ.get("SPEC_BACKEND", "calibrated").strip().lower()
-BACKENDS = {"calibrated", "quicklook", "ssb"}
+BACKENDS = {"calibrated", "quicklook", "ssb", "psd"}
 if SPEC_BACKEND not in BACKENDS:
     SPEC_BACKEND = "calibrated"
+
+# Backends whose STFT runs on the 28-multiple aligned_nfft grid.
+CALIBRATED_GRID_BACKENDS = frozenset({"calibrated", "ssb", "psd"})
 
 AVG_BIN_GROUPS = 12
 SSB_SUBCARRIER_SPACING = 30e3
@@ -183,6 +188,10 @@ DEFAULT_WINDOW_FILL        = Fraction(15, 28)
 DEFAULT_INTEGRATION_BW     = "auto"
 DEFAULT_LO_BANDSTOP        = SSB_LO_BANDSTOP
 DEFAULT_TRIM_STOPBAND      = False
+
+# Default PSD time_statistic (P2b-3) — reproduces the mean+max trace pair the
+# client has always drawn, so behaviour is unchanged until the user edits it.
+DEFAULT_PSD_TIME_STATISTIC = ("mean", "max")
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +468,24 @@ ANALYSIS_TARGETS = {
         # would falsely reject them; the fresh aperture re-probes at its own turn.
         "probe_reset": ("time_aperture",),
     },
+    # striqt power_spectral_density (P2b-3): the Welch-method statistic traces.
+    # Own parameter block (psd_* cfg keys) so tuning the PSD view never
+    # disturbs the spectrogram recipe, per-analysis-panel intent.
+    "psd": {
+        "fields": {
+            "window":                "psd_window",
+            "fractional_overlap":    "psd_fractional_overlap",
+            "window_fill":           "psd_window_fill",
+            "integration_bandwidth": "psd_integration_bandwidth",
+            "lo_bandstop":           "psd_lo_bandstop",
+            "trim_stopband":         "psd_trim_stopband",
+            "time_statistic":        "psd_time_statistic",
+        },
+        "virtual": ("frequency_resolution",),
+        "order": ("nfft", "psd_window", "psd_fractional_overlap",
+                  "psd_window_fill", "psd_integration_bandwidth",
+                  "psd_lo_bandstop", "psd_trim_stopband", "psd_time_statistic"),
+    },
 }
 
 # RadioConfig fields that are only settable through the validated "analysis"
@@ -480,6 +507,13 @@ ANALYSIS_DEFAULTS = {
     "lo_bandstop":           DEFAULT_LO_BANDSTOP,
     "trim_stopband":         DEFAULT_TRIM_STOPBAND,
     "time_aperture":         None,
+    "psd_window":                DEFAULT_WINDOW,
+    "psd_fractional_overlap":    DEFAULT_FRACTIONAL_OVERLAP,
+    "psd_window_fill":           DEFAULT_WINDOW_FILL,
+    "psd_integration_bandwidth": DEFAULT_INTEGRATION_BW,
+    "psd_lo_bandstop":           DEFAULT_LO_BANDSTOP,
+    "psd_trim_stopband":         DEFAULT_TRIM_STOPBAND,
+    "psd_time_statistic":        DEFAULT_PSD_TIME_STATISTIC,
 }
 
 
@@ -537,6 +571,48 @@ def _parse_optional_hz(value, *, auto_ok: bool = False):
     if value == 0:
         return None
     return value
+
+
+def _parse_time_statistic(value):
+    """Parse the PSD time_statistic surface: a list (or comma string) of named
+    statistics ('mean', 'max', …) and/or quantiles in [0, 1], e.g.
+    "mean, 0.5, 0.95, max". Returns a de-duplicated tuple of str/float.
+    Structure and quantile range are judged here (knowable); unknown statistic
+    NAMES are left for striqt itself to judge in tier 2. Raises ValueError."""
+    if isinstance(value, str):
+        tokens = [t.strip() for t in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        tokens = list(value)
+    else:
+        raise ValueError("time_statistic must be a list like mean, 0.95, max")
+    out = []
+    for tok in tokens:
+        if isinstance(tok, str):
+            tok = tok.strip().lower()
+            if not tok:
+                continue
+            try:
+                tok = float(tok)
+            except ValueError:
+                out.append(tok)
+                continue
+        if isinstance(tok, bool) or not isinstance(tok, (int, float)):
+            raise ValueError(f"{tok!r} is not a statistic name or quantile")
+        q = float(tok)
+        if not (0.0 <= q <= 1.0):
+            raise ValueError(
+                f"quantile {q!r} is out of range — entries must be statistic "
+                f"names (mean/max/…) or quantiles in [0, 1]"
+            )
+        out.append(q)
+    seen, dedup = set(), []
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            dedup.append(s)
+    if not dedup:
+        raise ValueError("time_statistic needs at least one entry (e.g. mean)")
+    return tuple(dedup)
 
 
 def _parse_optional_seconds(value):
@@ -599,11 +675,44 @@ def scratch_validate_spectrogram(cfg: "RadioConfig"):
     return None
 
 
+def scratch_validate_psd(cfg: "RadioConfig"):
+    """
+    Tier-2 judge for the PSD target (P2b-3): run striqt's real
+    power_spectral_density on a tiny synthetic buffer (2 STFT rows, single
+    channel) with the exact kwargs the live compute would use. Returns the
+    striqt error text on an illegal config (e.g. an unknown statistic name),
+    or None when it is safe to go live.
+    """
+    if not _ANALYSIS_OK:
+        return None
+    try:
+        sample_rate = float(cfg.sample_rate)
+        nfft   = aligned_nfft(cfg.nfft)
+        hop    = analysis_hop(nfft, cfg.psd_fractional_overlap)
+        needed = calibrated_sample_count(nfft, 2, hop)
+        kwargs = make_psd_kwargs(cfg, nfft, sample_rate)   # construction may raise
+        capture = analysis_specs.Capture(
+            sample_rate=sample_rate,
+            duration=needed / sample_rate,
+            analysis_bandwidth=float(cfg.analysis_bandwidth),
+        )
+        tiny = np.zeros((1, needed), dtype=np.complex64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            striqt_measurements.power_spectral_density(
+                tiny, capture, as_xarray=False, **kwargs
+            )
+    except Exception as e:
+        return str(e).strip() or type(e).__name__
+    return None
+
+
 # Tier-2 scratch validators, one per analysis target (P2b-1). Each judges a
 # proposed RadioConfig by running the target's real striqt pipeline on a tiny
 # synthetic buffer — never the live ring.
 SCRATCH_VALIDATORS = {
     "spectrogram": scratch_validate_spectrogram,
+    "psd":         scratch_validate_psd,
 }
 
 
@@ -656,6 +765,18 @@ class RadioConfig:
     #   time_aperture:         None, or seconds of binned RMS averaging along the
     #                          time axis (striqt requires a multiple of hop/fs)
     time_aperture:         object = None
+    # striqt PowerSpectralDensity analysis params (P2b-3) — an independent block
+    # so tuning the PSD view never disturbs the spectrogram recipe. Same field
+    # semantics as the spectrogram block, plus:
+    #   psd_time_statistic:  tuple of named statistics/quantiles evaluated along
+    #                        the time axis — one PSD trace per entry
+    psd_window:                object = DEFAULT_WINDOW
+    psd_fractional_overlap:    Fraction = DEFAULT_FRACTIONAL_OVERLAP
+    psd_window_fill:           Fraction = DEFAULT_WINDOW_FILL
+    psd_integration_bandwidth: object = DEFAULT_INTEGRATION_BW
+    psd_lo_bandstop:           object = DEFAULT_LO_BANDSTOP
+    psd_trim_stopband:         bool   = DEFAULT_TRIM_STOPBAND
+    psd_time_statistic:        tuple  = DEFAULT_PSD_TIME_STATISTIC
 
     def snapshot(self):
         return RadioConfig(
@@ -678,6 +799,13 @@ class RadioConfig:
             lo_bandstop=self.lo_bandstop,
             trim_stopband=bool(self.trim_stopband),
             time_aperture=self.time_aperture,
+            psd_window=self.psd_window,
+            psd_fractional_overlap=self.psd_fractional_overlap,
+            psd_window_fill=self.psd_window_fill,
+            psd_integration_bandwidth=self.psd_integration_bandwidth,
+            psd_lo_bandstop=self.psd_lo_bandstop,
+            psd_trim_stopband=bool(self.psd_trim_stopband),
+            psd_time_statistic=tuple(self.psd_time_statistic),
         )
 
 
@@ -968,7 +1096,15 @@ class SharedConfig:
         spec = ANALYSIS_TARGETS[target]
 
         eff = self._effective_radio(update)
-        on_calibrated_grid = eff.backend in {"calibrated", "ssb"}
+        # The spectrogram/PSD analysis pipelines ALWAYS execute on the aligned
+        # 28-multiple grid (their scratch validators and compute paths use
+        # aligned_nfft unconditionally), so tier-1 fraction snapping must use
+        # that grid regardless of which backend happens to be displayed —
+        # otherwise a value snapped to k/1024 in quicklook would break the
+        # window_fill integrality check the moment the calibrated view returns.
+        on_calibrated_grid = target in {"spectrogram", "psd"} or (
+            eff.backend in CALIBRATED_GRID_BACKENDS
+        )
 
         # --- Tier 1: knowable rules, routed per target ------------------------
         accepted, ack_field, requested_map = self._tier1_target(
@@ -1018,6 +1154,22 @@ class SharedConfig:
                 req, eff, on_calibrated_grid,
                 accepted, ack_field, requested_map, rounded, rejected,
             )
+            return accepted, ack_field, requested_map
+        if target == "psd":
+            accepted, ack_field, requested_map = self._tier1_freq_fields(
+                req, eff, cfg_prefix="psd_", ack_prefix="psd.",
+                on_calibrated_grid=on_calibrated_grid,
+                rounded=rounded, rejected=rejected,
+            )
+            if req.get("time_statistic") is not None:
+                requested = req["time_statistic"]
+                try:
+                    accepted["psd_time_statistic"] = _parse_time_statistic(requested)
+                    ack_field["psd_time_statistic"] = "psd.time_statistic"
+                    requested_map["psd_time_statistic"] = requested
+                except ValueError as e:
+                    rejected.append({"field": "psd.time_statistic",
+                                     "requested": requested, "reason": str(e)})
             return accepted, ack_field, requested_map
         raise RuntimeError(f"no tier-1 validator for analysis target {target!r}")
 
@@ -1550,6 +1702,88 @@ def calibrated_spectrogram(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
     return blocks, meta
 
 
+def make_psd_kwargs(cfg: "RadioConfig", nfft: int, sample_rate: float) -> dict:
+    """Keyword arguments for striqt's power_spectral_density from cfg's PSD
+    param block (P2b-3) — the exact spec the live compute and the tier-2
+    scratch validator both use."""
+    integration = resolve_integration_bandwidth(
+        cfg.psd_integration_bandwidth, nfft, sample_rate
+    )
+    lo = cfg.psd_lo_bandstop
+    return dict(
+        window=cfg.psd_window,
+        frequency_resolution=float(sample_rate) / float(nfft),
+        fractional_overlap=Fraction(cfg.psd_fractional_overlap),
+        window_fill=Fraction(cfg.psd_window_fill),
+        integration_bandwidth=integration,
+        trim_stopband=bool(cfg.psd_trim_stopband),
+        lo_bandstop=(float(lo) if lo else None),
+        time_statistic=tuple(cfg.psd_time_statistic),
+    )
+
+
+def psd_traces(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
+    """
+    striqt power_spectral_density backend (P2b-3): Welch-method statistic
+    traces over the frame's time span, one row per configured time_statistic
+    entry. Returns (blocks, meta) — blocks (channels, n_statistics, bins)
+    float32 dB; meta discloses the statistic list (psd_stats) and the true
+    integrated span (time_span_ms) alongside the usual axis params.
+    """
+    if not _ANALYSIS_OK:
+        raise RuntimeError(f"PSD backend unavailable: {_ANALYSIS_ERR!r}")
+
+    samples = np.asarray(samples, dtype=np.complex64)
+    rows        = int(cfg.rows)
+    sample_rate = float(cfg.sample_rate)
+    nfft        = aligned_nfft(cfg.nfft)
+    hop         = analysis_hop(nfft, cfg.psd_fractional_overlap)
+    needed      = calibrated_sample_count(nfft, rows, hop)
+    if samples.shape[1] < needed:
+        pad = np.zeros((samples.shape[0], needed - samples.shape[1]), dtype=np.complex64)
+        samples = np.concatenate([samples, pad], axis=1)
+    else:
+        samples = samples[:, -needed:]
+
+    capture = analysis_specs.Capture(
+        sample_rate=sample_rate,
+        duration=needed / sample_rate,
+        analysis_bandwidth=float(cfg.analysis_bandwidth),
+    )
+    kwargs = make_psd_kwargs(cfg, nfft, sample_rate)
+    integration = kwargs["integration_bandwidth"]
+    average_bins = (
+        1 if integration is None
+        else max(1, round(integration / (sample_rate / nfft)))
+    )
+    psd, _ = striqt_measurements.power_spectral_density(
+        samples, capture, as_xarray=False, **kwargs
+    )
+    psd = np.asarray(psd, dtype=np.float32)   # (channels, n_stats, bins), dB
+    blocks = fit_display_rows(
+        psd, psd.shape[1],
+        bin_avg=average_bins, fft_nfft=nfft, sample_rate=sample_rate,
+        lo_null=cfg.lo_null, lo_bandstop=cfg.psd_lo_bandstop,
+    )
+    meta = {
+        "fft_nfft": int(nfft), "bin_avg": int(average_bins), "hop_size": int(hop),
+        "psd_stats": [str(s) for s in cfg.psd_time_statistic],
+        "time_span_ms": 1e3 * needed / sample_rate,
+    }
+    # Exact striqt frequency coordinates, same contract as the calibrated path.
+    try:
+        spg_kwargs = {k: v for k, v in kwargs.items() if k != "time_statistic"}
+        spg_spec = analysis_specs.Spectrogram(**spg_kwargs)
+        freqs = np.asarray(striqt_shared.spectrogram_freqs(capture, spg_spec),
+                           dtype=np.float64)
+        if freqs.size >= 2:
+            meta["freqs_hz_f0"]   = float(freqs[0])
+            meta["freqs_hz_step"] = float(freqs[1] - freqs[0])
+    except Exception:
+        pass   # fall back to build_header's symmetric axis
+    return blocks, meta
+
+
 def ssb_spectrogram(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
     """
     5G SSB spectrogram path from striqt. The returned SSB block and symbol axes
@@ -1638,11 +1872,20 @@ def calibrated_sample_count(nfft: int, rows: int, hop=None) -> int:
     return int(rows * hop + (nfft - hop))
 
 
+def backend_overlap(cfg: RadioConfig):
+    """The fractional_overlap the executing backend's STFT uses (P2b-3): the
+    PSD backend runs its own param block; calibrated/ssb share the spectrogram
+    block."""
+    return cfg.psd_fractional_overlap if cfg.backend == "psd" else cfg.fractional_overlap
+
+
 def row_hop(cfg: RadioConfig) -> int:
-    """Samples of signal one display row spans for cfg's backend (P2a-1)."""
-    if cfg.backend in {"calibrated", "ssb"}:
+    """Samples of signal one display row spans for cfg's backend (P2a-1). For
+    the PSD backend a "row" is one STFT row feeding the statistics, so the
+    duration→rows mapping controls the integrated time span (P2b-3)."""
+    if cfg.backend in CALIBRATED_GRID_BACKENDS:
         nfft = aligned_nfft(cfg.nfft)
-        return analysis_hop(nfft, cfg.fractional_overlap)
+        return analysis_hop(nfft, backend_overlap(cfg))
     return max(1, int(cfg.nfft))
 
 
@@ -1659,9 +1902,9 @@ def max_live_rows(cfg: RadioConfig) -> int:
     which is expected and left honest — the cap protects the radio, not the fps).
     """
     limit = int(MAX_TAIL * RING_ROW_FILL)
-    if cfg.backend in {"calibrated", "ssb"}:
+    if cfg.backend in CALIBRATED_GRID_BACKENDS:
         nfft = aligned_nfft(cfg.nfft)
-        hop  = analysis_hop(nfft, cfg.fractional_overlap)
+        hop  = analysis_hop(nfft, backend_overlap(cfg))
         rows = (limit - (nfft - hop)) // hop
     else:
         rows = limit // max(1, int(cfg.nfft))
@@ -1716,12 +1959,12 @@ def fit_display_rows(
 
 
 def samples_needed(cfg: RadioConfig) -> int:
-    if cfg.backend in {"calibrated", "ssb"}:
+    if cfg.backend in CALIBRATED_GRID_BACKENDS:
         # Overlapped STFT: only rows·hop + (nfft-hop) samples are needed to
         # produce cfg.rows display rows (LV-W2), not the full nfft·rows.
         nfft = aligned_nfft(cfg.nfft)
         base = calibrated_sample_count(
-            nfft, cfg.rows, analysis_hop(nfft, cfg.fractional_overlap)
+            nfft, cfg.rows, analysis_hop(nfft, backend_overlap(cfg))
         )
     else:
         base = int(cfg.nfft * cfg.rows)
@@ -1753,6 +1996,9 @@ def compute_blocks(samples: np.ndarray, cfg: RadioConfig):
     elif requested == "calibrated":
         blocks, meta = calibrated_spectrogram(samples, cfg)
         executed = "calibrated"
+    elif requested == "psd":
+        blocks, meta = psd_traces(samples, cfg)
+        executed = "psd"
     elif requested == "ssb":
         blocks, meta = ssb_spectrogram(samples, cfg)
         executed = "ssb"
@@ -1812,6 +2058,13 @@ def build_header(cfg: RadioConfig, blocks: list, meta: dict, demo: bool = False)
         "hop_size":      int(meta.get("hop_size", fft_nfft) or fft_nfft),
         "time":          time.time(),
     }
+    # PSD-backend extras (P2b-3, additive): the statistic behind each block row
+    # and the true integrated time span (block rows are statistics, not time,
+    # so the hop-based window label doesn't apply).
+    if meta.get("psd_stats") is not None:
+        header["psd_stats"] = list(meta["psd_stats"])
+    if meta.get("time_span_ms") is not None:
+        header["time_span_ms"] = float(meta["time_span_ms"])
     requested = str(meta.get("backend_requested", executed))
     if requested != executed:
         header["backend_requested"] = requested
@@ -2349,12 +2602,18 @@ def current_config():
     Also the re-sync source after every settings/analysis ack.
     """
     cfg = _shared.snapshot()
-    on_calibrated_grid = cfg.backend in {"calibrated", "ssb"}
-    nfft_exec = aligned_nfft(cfg.nfft) if on_calibrated_grid else int(cfg.nfft)
+    # The analysis pipelines always execute on the aligned 28-multiple grid, so
+    # the resolutions reported for their blocks use it regardless of backend.
+    nfft_exec = aligned_nfft(cfg.nfft)
     window = list(cfg.window) if isinstance(cfg.window, tuple) else cfg.window
     integration = cfg.integration_bandwidth
     if not (integration is None or isinstance(integration, str)):
         integration = float(integration)
+    psd_window = (list(cfg.psd_window) if isinstance(cfg.psd_window, tuple)
+                  else cfg.psd_window)
+    psd_integration = cfg.psd_integration_bandwidth
+    if not (psd_integration is None or isinstance(psd_integration, str)):
+        psd_integration = float(psd_integration)
     return _json_safe({
         "capture": {
             "center_frequency":    float(cfg.center),
@@ -2376,6 +2635,17 @@ def current_config():
             "lo_bandstop":           float(cfg.lo_bandstop) if cfg.lo_bandstop else None,
             "trim_stopband":         bool(cfg.trim_stopband),
             "time_aperture":         float(cfg.time_aperture) if cfg.time_aperture else None,
+        },
+        "analysis_psd": {
+            "window":                psd_window,
+            "frequency_resolution":  float(cfg.sample_rate) / nfft_exec,
+            "fractional_overlap":    str(cfg.psd_fractional_overlap),
+            "window_fill":           str(cfg.psd_window_fill),
+            "integration_bandwidth": psd_integration,
+            "lo_bandstop":           float(cfg.psd_lo_bandstop) if cfg.psd_lo_bandstop else None,
+            "trim_stopband":         bool(cfg.psd_trim_stopband),
+            "time_statistic":        [s if isinstance(s, str) else float(s)
+                                      for s in cfg.psd_time_statistic],
         },
         "backend": str(cfg.backend),
         "rows":    int(cfg.rows),
@@ -2580,7 +2850,7 @@ def main():
                         help="Listen port")
     args = parser.parse_args()
 
-    if args.demo and not _ANALYSIS_OK and args.backend in {"calibrated", "ssb"}:
+    if args.demo and not _ANALYSIS_OK and args.backend in CALIBRATED_GRID_BACKENDS:
         print("[demo] striqt.analysis unavailable; falling back to quicklook backend")
         SPEC_BACKEND = "quicklook"
     else:

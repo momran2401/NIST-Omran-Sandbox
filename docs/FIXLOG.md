@@ -697,3 +697,31 @@ hop_size 15120 → 19.69 ms label; changing overlap re-derives rows and keeps th
 raises striqt's multiple-of-hop error (tier-3 catches it live). **Verify [hardware]:** with a
 real signal, a 1 ms aperture visibly smooths the waterfall texture and reduces rows ~28×; the
 time label still matches the Duration control.
+
+### P2b-3 — PSD backend: power_spectral_density params + time_statistic (server)
+**Files:** `live/striqt_web_server.py`
+**Changed:** New `"psd"` backend runs striqt's real `power_spectral_density` (Welch method) and
+ships one trace per configured statistic: blocks are `(channels, n_statistics, bins)` float32
+dB, additive header keys `psd_stats` (the statistic behind each row) and `time_span_ms` (the
+true integrated span) disclose the shape. The PSD gets its **own** `RadioConfig` param block
+(`psd_window/…/psd_trim_stopband`, `psd_time_statistic`, defaults identical to the spectrogram
+recipe + `("mean","max")`), so tuning the PSD view never disturbs the spectrogram recipe. A new
+`"psd"` entry in `ANALYSIS_TARGETS` reuses `_tier1_freq_fields` verbatim against the `psd_`
+keys (acks labeled `psd.<field>`); `time_statistic` parses "mean, 0.5, 0.95, max" style lists
+(tier 1: structure + quantiles in [0,1]; unknown statistic NAMES go to tier 2, where
+`scratch_validate_psd` runs the real measurement on a 2-row buffer and returns striqt's own
+reason, e.g. the valid-name list). `/config` gains an `analysis_psd` block. Backend plumbing:
+`CALIBRATED_GRID_BACKENDS` + `backend_overlap()` make `row_hop`/`max_live_rows`/
+`samples_needed` honor the PSD block's overlap, so Duration owns the PSD's integrated span
+hop-aware. Also fixed: tier-1 fraction snapping now always uses the aligned 28-multiple grid
+for spectrogram/PSD targets (the pipelines execute there unconditionally) — under P2a a value
+snapped to k/1024 while quicklook was displayed broke window_fill integrality when the
+calibrated view returned.
+
+**Verify [demo]:** offline harness: `time_statistic: "mean, 0.5, 0.95, 0.99, max"` applies and
+a 20 ms frame computes (2, 5, 83) blocks with `psd_stats`/`time_span_ms` in the header and
+sane trace ordering (p99 ≤ max, mean ≤ max at a tone); `"bogus"` is rejected with striqt's
+valid-name list; quantile 1.5 rejected at tier 1; editing psd window/overlap leaves the
+spectrogram block untouched and re-derives rows from the psd hop; `/config.analysis_psd`
+mirrors it all. **Verify [hardware]:** percentile traces over a real bursty signal order
+correctly (p50 < p95 < p99 < max) and the mean trace matches the old client-computed mean.
