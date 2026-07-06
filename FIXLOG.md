@@ -221,3 +221,21 @@ off-list value can't reach `arm_spec` or trip the calibrated `ValueError` guard.
 **Verify [demo]:** in the browser console, `ws.send("garbage")`, `ws.send('{"center":"abc"}')`,
 and `ws.send('{"sample_rate":9e6}')` leave the stream running and log an ignore message;
 `ws.send('{"sample_rate":30720000}')` still retunes.
+
+### LV-R3 — Single-viewer: close the accept race, liveness ping + takeover, distinct close codes
+**Files:** `live/striqt_web_server.py`, `live/web/app.js`
+**Changed:** Wrapped the single-viewer slot check + accept in a module `asyncio.Lock` (`_slot_lock`)
+so two interleaving handshakes can't both pass the empty check. Busy refusals now use a distinct
+**4001** close code (vs 1008 for auth). Added a liveness probe: on each 15 s receive timeout the
+server sends a `{"message":"ping"}`; two consecutive send failures drop the client, freeing the
+slot within ~30 s so a waiting viewer's 1.2 s reconnect loop takes over. Client `onclose` inspects
+`event.code`: 1008 → "authentication failed — reload" and **stops** reconnecting; 4001 → "another
+viewer is connected — retrying…"; else the existing reconnect.
+**Deviation from the handoff:** for the busy refusal I `accept()` then `close(4001)` rather than
+closing before accept — a close *before* accept aborts the WS handshake and the browser sees 1006
+(abnormal), so the 4001 code would never reach the client; accept-then-close delivers it. The 2nd
+socket is never added to `_connections`, so the broadcaster never sends to it.
+
+**Verify [demo]:** two browser tabs — the second shows the busy state and takes over within ~2 s of
+closing the first; kill the holder's network (devtools offline) and the slot frees within ~30 s;
+a wrong-password reload shows the auth state instead of silent retry.

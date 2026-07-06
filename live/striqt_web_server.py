@@ -1342,6 +1342,7 @@ _computer: "Computer | None"                 = None
 _shared:   "SharedConfig | None"             = None
 _quantize: bool                              = False
 _connections: set                            = set()
+_slot_lock                                   = asyncio.Lock()  # guards the single-viewer slot
 
 
 @asynccontextmanager
@@ -1475,21 +1476,36 @@ async def ws_endpoint(ws: WebSocket):
         {"center": Hz, "sample_rate": Hz, "gain": dB, "nfft": int, "rows": int}
     Sends spectrogram frames as binary (see serialize_frame).
     """
-    if _connections:
-        await ws.close(code=1008)
-        print(f"[ws] refused extra client: {ws.client}")
-        return
-
-    await ws.accept()
-    _connections.add(ws)
+    # Single-viewer slot, guarded so two interleaving handshakes can't both pass
+    # the empty check (LV-R3). Busy refusals use a distinct 4001 code (vs 1008 for
+    # auth) so the client can tell "another viewer connected" from "unauthorized".
+    async with _slot_lock:
+        if _connections:
+            await ws.accept()
+            await ws.close(code=4001)
+            print(f"[ws] refused extra client (slot busy): {ws.client}")
+            return
+        await ws.accept()
+        _connections.add(ws)
     client = ws.client
     print(f"[ws] client connected: {client}")
+    misses = 0
     try:
         while True:
             try:
                 text = await asyncio.wait_for(ws.receive_text(), timeout=15.0)
             except asyncio.TimeoutError:
-                # Keepalive: no control data in 15 s is normal.
+                # Liveness probe: if the client is gone, free the slot promptly (so a
+                # waiting viewer's reconnect can take over) instead of holding it until
+                # TCP times out minutes later (LV-R3).
+                try:
+                    await ws.send_text('{"message":"ping"}')
+                    misses = 0
+                except Exception:
+                    misses += 1
+                    if misses >= 2:
+                        print(f"[ws] client {client} unresponsive; dropping")
+                        break
                 continue
             try:
                 ctrl = json.loads(text)

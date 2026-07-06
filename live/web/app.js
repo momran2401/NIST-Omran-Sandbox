@@ -204,9 +204,20 @@ function connect() {
         if (!paused) onFrame(e.data);
     };
 
-    ws.onclose = () => {
-        setStatus("disconnected — reconnecting…", "warn");
-        logMsg("WebSocket disconnected; retrying in 1.2 s", "WARN");
+    ws.onclose = (event) => {
+        // Distinct close codes (LV-R3): 1008 = auth failed, 4001 = viewer slot busy.
+        if (event && event.code === 1008) {
+            setStatus("authentication failed — reload to log in", "error");
+            logMsg("WebSocket closed: authentication failed (1008)", "ERROR");
+            return;   // do NOT reconnect on an auth failure
+        }
+        if (event && event.code === 4001) {
+            setStatus("another viewer is connected — retrying…", "warn");
+            logMsg("Viewer slot busy (4001); retrying in 1.2 s", "WARN");
+        } else {
+            setStatus("disconnected — reconnecting…", "warn");
+            logMsg("WebSocket disconnected; retrying in 1.2 s", "WARN");
+        }
         setTimeout(connect, 1200);
     };
 
