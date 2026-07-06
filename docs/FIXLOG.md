@@ -819,3 +819,20 @@ PSD/SSB/Quicklook swaps the fields (and badge) and a bare Apply on each target r
 `subcarrier spacing` reshapes the burst view; all panels re-seed to the server's executed
 values after a rounded ack. ARIC mode shows no panel. **Verify [hardware]:** none beyond the
 P2b-2/3/5 server items (pure UI routing).
+
+### P2b-7 — SSB-grid rates survive the LTE-list snap (no rearm churn)
+**Files:** `live/striqt_web_server.py`
+**Changed:** With the SSB backend at a retuned rate (13.44 MS/s), a bare Capture-form Apply
+re-sent the server's own `sample_rate`, which the generic update loop snapped onto the LTE
+list (→ 15.36 MS/s) only for the P2b-5 retune to snap it straight back — a net-zero change
+that still marked the config dirty and re-armed the radio (ring clear + display blank) on
+every bare Apply. The sample-rate snap now consults the message's effective backend/SCS: a
+rate already on the SSB grid passes through untouched while SSB is (or becomes) the backend;
+every other case still snaps to `RATES_HZ`, and off-grid rates chosen while in SSB still
+retune with the reported ack.
+
+**Verify [demo]:** offline harness: after selecting SSB (fs 13.44), a bare Apply of the
+server-seeded capture values returns `applied []` (no rearm); choosing 7.68 MS/s while in SSB
+applies-then-retunes with the reported `rounded sample_rate → 13.44e6`; on the calibrated
+backend 13.44 still snaps to 15.36. **Verify [hardware]:** with SSB live, a bare Apply causes
+no waterfall blank/rearm log line.

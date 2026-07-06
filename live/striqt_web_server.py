@@ -1546,6 +1546,19 @@ class SharedConfig:
         } | ANALYSIS_CFG_KEYS
         changes = []
         with self._lock:
+            # Effective backend/SCS for THIS message: an SSB-grid rate (e.g. the
+            # retuned 13.44 MS/s coming back from a server-seeded form) must not
+            # be snapped onto the LTE list only for the SSB retune to undo it —
+            # that round trip would dirty the config and re-arm the radio on
+            # every bare Apply.
+            eff_backend = str(update.get("backend", self._cfg.backend)).strip().lower()
+            if eff_backend not in BACKENDS:
+                eff_backend = self._cfg.backend
+            try:
+                eff_scs = float(update.get("ssb_subcarrier_spacing",
+                                           self._cfg.ssb_subcarrier_spacing))
+            except (TypeError, ValueError):
+                eff_scs = float(self._cfg.ssb_subcarrier_spacing)
             for key, value in update.items():
                 if key not in valid:
                     continue
@@ -1593,7 +1606,9 @@ class SharedConfig:
                 elif key == "center":
                     value = float(max(300e6, min(value, 6e9)))
                 elif key == "sample_rate":
-                    value = float(_snap(value, RATES_HZ))
+                    value = float(value)
+                    if not (eff_backend == "ssb" and ssb_grid_compatible(value, eff_scs)):
+                        value = float(_snap(value, RATES_HZ))
                     value = float(max(1e6, min(value, 125e6)))
                 elif key == "gain":
                     value = float(max(-60.0, min(value, 10.0)))
