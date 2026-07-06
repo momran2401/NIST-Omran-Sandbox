@@ -482,12 +482,15 @@ function psdSeries(channels, blocks, rows, nfft) {
             const off = r * nfft;
             for (let f = 0; f < nfft; f++) {
                 const v = buf[off + f];
-                m[f] += v;
+                m[f] += Math.pow(10, v / 10);   // accumulate LINEAR power (LV-F3)
                 if (v > x[f]) x[f] = v;
                 if (v < n[f]) n[f] = v;
             }
         }
-        for (let f = 0; f < nfft; f++) m[f] /= depth;
+        // Convert the linear-power mean back to dB. Averaging dB directly
+        // underreports the time-averaged power of fluctuating signals; this
+        // mirrors the band monitor's (correct) linear convention.
+        for (let f = 0; f < nfft; f++) m[f] = 10 * Math.log10(Math.max(m[f] / depth, 1e-20));
 
         mean[ch] = m;
         max[ch]  = x;

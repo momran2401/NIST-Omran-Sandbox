@@ -105,3 +105,16 @@ compatible but aren't selectable.
 **Verify [demo]:** `--demo --backend ssb`: header decodes to `backend:"calibrated"` with
 `backend_requested:"ssb"`, the meta shows `calibrated` + a warning status line; switching rates
 keeps it consistent; no striqt `ValueError` spam in the server output.
+
+### LV-F3 — PSD "Mean" trace: average in linear power, not dB
+**File:** `live/web/app.js`
+**Changed:** `psdSeries` accumulated the mean trace as an arithmetic mean of dB values (biased
+low for fluctuating signals). Now accumulates `10**(v/10)` per row and converts back with
+`10·log10(max(mean/depth, 1e-20))`, mirroring the band monitor's (already-correct) linear
+convention. Max/min traces are order statistics — left unchanged.
+**Deferred (optional in the finding):** the same one-line change in the Qt viewers
+(`striqt_standalone.py:1544`, `striqt_frontend_TCP.py:807`, `pluto_standalone.py`) — Qt-only,
+not exercisable on port 8001. Ask if you want it applied.
+
+**Verify [demo]:** band monitor "RX1 x.x dB" over a dragged band equals the average of the
+fixed mean trace over the same band within ~0.5 dB (previously the mean trace read lower).
