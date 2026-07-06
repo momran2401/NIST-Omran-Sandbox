@@ -38,6 +38,7 @@ import struct
 import sys
 import threading
 import time
+import warnings
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from fractions import Fraction
@@ -525,7 +526,11 @@ def scratch_validate_analysis(cfg: "RadioConfig"):
             analysis_bandwidth=float(cfg.analysis_bandwidth),
         )
         tiny = np.zeros((1, needed), dtype=np.complex64)
-        striqt_shared.evaluate_spectrogram(tiny, capture, spec, dtype="float32", dB=True)
+        with warnings.catch_warnings():
+            # The 2-row zero buffer is degenerate on purpose; numeric warnings
+            # (empty-slice means etc.) are expected noise, not verdicts.
+            warnings.simplefilter("ignore")
+            striqt_shared.evaluate_spectrogram(tiny, capture, spec, dtype="float32", dB=True)
     except Exception as e:
         return str(e).strip() or type(e).__name__
     return None
@@ -544,6 +549,11 @@ class RadioConfig:
     rows:        int   = DEFAULT_ROWS
     backend:     str   = SPEC_BACKEND
     lo_null:     bool  = True
+    # Displayed time span in seconds (P2a-4). When > 0, duration OWNS rows: they
+    # are re-derived hop-aware (duration·fs / row_hop) on every change to nfft/
+    # backend/overlap/sample_rate. 0 = legacy rows-driven mode (an explicit
+    # top-level {"rows": N} control reclaims ownership by zeroing this).
+    duration:    float = 0.0
     # Capture knobs surfaced by the schema editor (P1-2). Defaults reproduce the
     # values make_capture used to hardcode, so behaviour is unchanged until the
     # user edits them. backend_sample_rate == 0 means "track sample_rate".
@@ -577,6 +587,7 @@ class RadioConfig:
             rows=int(self.rows),
             backend=str(self.backend),
             lo_null=bool(self.lo_null),
+            duration=float(self.duration),
             analysis_bandwidth=float(self.analysis_bandwidth),
             lo_shift=str(self.lo_shift),
             host_resample=bool(self.host_resample),
@@ -840,14 +851,23 @@ class SharedConfig:
         reconnect = []
         rounded = []
         rejected = []
+        # An explicit top-level {"rows": N} control reclaims rows ownership from
+        # duration (P2a-4). Recorded before the capture branch merges its own
+        # duration-derived keys into the update.
+        explicit_rows = update.get("rows") is not None
         # Capture fields that map to a live radio parameter; the rest are rendered
         # by the editor but cannot be applied live — reported, not dropped (LV-F6).
         # The four capture knobs below share their name with the cfg field, so they
         # pass straight through (P1-2); they take effect on the next re-arm.
+        # `duration` is now a first-class cfg field (P2a-4): it maps straight
+        # through, and rows are derived from it hop-aware AFTER all of this
+        # message's changes land (see the post-loop derivation below) — so the
+        # mapping always uses the effective backend/nfft/overlap (LV-R9b).
         passthru_capture = {
             "analysis_bandwidth", "lo_shift", "host_resample", "backend_sample_rate",
+            "duration",
         }
-        capture_mapped = {"center_frequency", "sample_rate", "gain", "duration"} | passthru_capture
+        capture_mapped = {"center_frequency", "sample_rate", "gain", "nfft"} | passthru_capture
         if "capture" in update and isinstance(update["capture"], dict):
             capture = update["capture"]
             mapped = {}
@@ -857,23 +877,11 @@ class SharedConfig:
                 mapped["sample_rate"] = capture["sample_rate"]
             if capture.get("gain") is not None:
                 mapped["gain"] = capture["gain"]
+            if capture.get("nfft") is not None:
+                mapped["nfft"] = capture["nfft"]
             for key in passthru_capture:
                 if capture.get(key) is not None:
                     mapped[key] = capture[key]
-            if capture.get("duration") is not None:
-                try:
-                    # Map duration→rows using values from THIS message when it also
-                    # changes them, not the pre-update cfg (LV-R9b). Clamp to what
-                    # the ring can supply for the effective backend/nfft (P1-5).
-                    eff = self.snapshot()
-                    nfft        = int(capture.get("nfft") or eff.nfft)
-                    sample_rate = float(capture.get("sample_rate") or eff.sample_rate)
-                    eff.nfft = nfft
-                    eff.sample_rate = sample_rate
-                    rows = round(float(capture["duration"]) * sample_rate / max(nfft, 1))
-                    mapped["rows"] = max(1, min(rows, max_live_rows(eff)))
-                except Exception:
-                    pass
             ignored = sorted(
                 k for k, v in capture.items() if v is not None and k not in capture_mapped
             )
@@ -900,6 +908,7 @@ class SharedConfig:
         valid = {
             "center", "sample_rate", "gain", "nfft", "rows", "backend", "lo_null",
             "analysis_bandwidth", "lo_shift", "host_resample", "backend_sample_rate",
+            "duration",
         } | ANALYSIS_CFG_KEYS
         changes = []
         with self._lock:
@@ -935,6 +944,11 @@ class SharedConfig:
                     # Already validated by _validate_analysis — only its
                     # survivors reach this loop (top-level copies are stripped).
                     pass
+                elif key == "duration":
+                    try:
+                        value = max(0.0, float(value))   # seconds; 0 = rows-driven
+                    except (TypeError, ValueError):
+                        continue
                 else:
                     value = int(value) if key in {"nfft", "rows"} else float(value)
                 # Clamp rows to what the ring can supply for the current backend/
@@ -958,6 +972,23 @@ class SharedConfig:
                 setattr(self._cfg, key, value)
                 changes.append((key, old, value))
             if changes:
+                # Rows ownership (P2a-4): an explicit top-level rows control
+                # reclaims rows-driven mode; otherwise a positive duration owns
+                # rows and re-derives them hop-aware from the FINAL state of
+                # this update (duration·fs / row_hop) — matching the client's
+                # time-axis label for any backend/nfft/overlap combination.
+                changed_keys = {k for k, _, _ in changes}
+                if explicit_rows and "duration" not in changed_keys and self._cfg.duration:
+                    changes.append(("duration", self._cfg.duration, 0.0))
+                    self._cfg.duration = 0.0
+                if self._cfg.duration > 0:
+                    rows_new = int(max(1, min(
+                        round(self._cfg.duration * self._cfg.sample_rate / row_hop(self._cfg)),
+                        max_live_rows(self._cfg),
+                    )))
+                    if rows_new != self._cfg.rows:
+                        changes.append(("rows", self._cfg.rows, rows_new))
+                        self._cfg.rows = rows_new
                 # A new overlap/nfft/backend changes the per-row hop, which can
                 # push samples_needed(rows) past what the ring can supply — the
                 # Computer's avail >= need gate would then never pass and the
@@ -1111,11 +1142,17 @@ def make_source():
 def make_capture(cfg):
     # port stays fixed at CHANNELS — the two-waterfall UI depends on both RX ports
     # (P1-2). The other four knobs are now driven by the schema editor / cfg.
+    # When cfg.duration owns the time axis (P2a-4) it drives the armed capture
+    # duration honestly; snapped to an integer sample count because striqt's
+    # Capture validation requires duration·sample_rate to be an integer.
+    duration = cfg.duration if cfg.duration > 0 else cfg.rows * cfg.nfft / cfg.sample_rate
+    duration = max(duration, 1e-3)
+    duration = round(duration * cfg.sample_rate) / cfg.sample_rate
     return specs.SoapyCapture(
         port=CHANNELS,
         center_frequency=cfg.center,
         gain=tuple([cfg.gain] * len(CHANNELS)),
-        duration=max(cfg.rows * cfg.nfft / cfg.sample_rate, 1e-3),
+        duration=duration,
         sample_rate=cfg.sample_rate,
         backend_sample_rate=(cfg.backend_sample_rate or cfg.sample_rate),
         host_resample=cfg.host_resample,

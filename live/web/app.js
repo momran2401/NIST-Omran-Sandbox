@@ -48,6 +48,7 @@ let curF0       = null;     // header freqs_hz_f0 (true axis origin, Hz baseband
 let curStep     = null;     // header freqs_hz_step (true bin spacing, Hz)
 let curFftNfft  = 1024;     // header fft_nfft (real FFT size behind the bin count)
 let curBinAvg   = 1;        // header bin_avg (frequency-bin averaging factor)
+let curHopSize  = null;     // header hop_size (samples of signal per display row, P2a-4)
 let lastBackendWarn = null; // dedups the "SSB unavailable" status warning
 let levels      = [-90, -10];
 
@@ -106,7 +107,7 @@ function setStatus(text, cls = "") {
 function updateMeta() {
     if (!curBins || !curFs) return;
     const depthRows = wfBuf[0] ? wfBuf[0].length / curBins : curRows;
-    const winMs     = (depthRows * radioNfft * backendHopFrac() / curFs * 1e3).toFixed(0);
+    const winMs     = (depthRows * rowHopSamples() / curFs * 1e3).toFixed(0);
     const mode      = replaceMode ? "flicker" : "waterfall";
     const scale     = autoColor ? "auto" : "manual";
     const analysis  = curBackend;   // executed backend from the header (honest — LV-F2)
@@ -148,11 +149,14 @@ function buildFreqsMHz(center, fs, nfft, absoluteRF, f0, step) {
     return f;
 }
 
-// Hop fraction of the radio FFT size between successive STFT rows. Quicklook
-// takes non-overlapping full-length FFTs (hop = nfft); the calibrated/ssb striqt
-// path uses window_fill = 15/28, so the hop is nfft·15/28 (finer time spacing).
-function backendHopFrac() {
-    return curBackend === "quicklook" ? 1 : 15 / 28;
+// Samples of signal one displayed STFT row spans. The server ships the exact
+// value in the frame header (hop_size, P2a-4) — correct for any FFT size and
+// fractional_overlap. Fallback for old headers: quicklook takes non-overlapping
+// full-length FFTs (hop = nfft); calibrated/ssb use the default 13/28 overlap,
+// so the hop is nfft·15/28.
+function rowHopSamples() {
+    if (curHopSize) return curHopSize;
+    return Math.max(1, Math.round(radioNfft * (curBackend === "quicklook" ? 1 : 15 / 28)));
 }
 
 // Absolute ceiling on client-side display rows — matches the server's
@@ -160,13 +164,23 @@ function backendHopFrac() {
 // every long duration to the same span and made the Duration control inert.
 const CLIENT_MAX_ROWS = 4096;
 
-// Rows the display window spans. windowMs of signal advances by (radioNfft·hopFrac)
-// samples per STFT row, so rows = windowMs·fs / (radioNfft·hopFrac). Uses the
-// requested radio FFT size, NOT the per-frame averaged bin count. The cap is a
-// generous safety ceiling (not a low clamp), so a longer duration honestly
-// renders more rows — the meta/axis ms label reflects the actual rows shown.
-function rowsForWindow(fs, radioNfft, windowMs, hopFrac) {
-    return Math.max(1, Math.min(Math.round(windowMs / 1000 * fs / (radioNfft * hopFrac)), CLIENT_MAX_ROWS));
+// Rows the display window spans. windowMs of signal advances by rowHopSamples()
+// per STFT row, so rows = windowMs·fs / hop. The cap is a generous safety
+// ceiling (not a low clamp), so a longer duration honestly renders more rows —
+// the meta/axis ms label reflects the actual rows shown.
+function rowsForWindowMs(ms) {
+    return Math.max(1, Math.min(Math.round(ms / 1000 * curFs / rowHopSamples()), CLIENT_MAX_ROWS));
+}
+
+// Send the time-axis control (P2a-4). Duration stays the single owner (P1-4):
+// in replace (Boring) mode the SERVER derives rows hop-aware from a first-class
+// capture.duration — so the JSON drives the radio honestly and the ↕ ms label
+// (computed from header hop_size) matches exactly. In scroll (Cool) mode the
+// client display depth follows windowMs and the server streams fixed 12-row
+// frame chunks (an explicit rows control, which reclaims rows ownership).
+function sendTimeControl() {
+    if (replaceMode) sendControl({ capture: { duration: windowMs / 1000 } });
+    else             sendControl({ rows: 12 });
 }
 
 // Mirror of the server's ssb_grid_compatible: the true SSB path needs the sample
@@ -198,8 +212,9 @@ function connect() {
     ws.onopen = () => {
         setStatus("connected", "ok");
         logMsg("WebSocket connected");
-        // Tell the server our initial window size
-        sendControl({ rows: rowsForWindow(curFs, radioNfft, windowMs, backendHopFrac()) });
+        // Tell the server our initial time window (duration in replace mode,
+        // fixed frame chunks in scroll mode — P2a-4)
+        sendTimeControl();
     };
 
     ws.onmessage = (e) => {
@@ -258,7 +273,8 @@ function onFrame(data) {
     lastRender = nowRender;
 
     const { nfft, rows, channels, center, fs, gain, dtype, scale, backend,
-            backend_requested, freqs_hz_f0, freqs_hz_step, fft_nfft, bin_avg } = header;
+            backend_requested, freqs_hz_f0, freqs_hz_step, fft_nfft, bin_avg,
+            hop_size } = header;
     let offset = 4 + hdrLen;
 
     // ── Parse blocks ──────────────────────────────────────────────────────
@@ -290,6 +306,7 @@ function onFrame(data) {
     curBackend = backend || curBackend;
     curFftNfft = (fft_nfft !== undefined && fft_nfft !== null) ? fft_nfft : nfft;
     curBinAvg  = (bin_avg  !== undefined && bin_avg  !== null) ? bin_avg  : 1;
+    curHopSize = (hop_size !== undefined && hop_size !== null) ? hop_size : null;
 
     // Honest backend reporting: warn once when the server had to substitute a
     // backend (e.g. SSB is unavailable at this sample rate) — LV-F2.
@@ -355,7 +372,7 @@ const wfImageData = { 0: null, 1: null };
 
 function computeDisplayDepth(rows, nfft, fs) {
     if (replaceMode) return rows;
-    return rowsForWindow(fs, radioNfft, windowMs, backendHopFrac());
+    return rowsForWindowMs(windowMs);
 }
 
 function updateWaterfall(ch, block, rows, nfft, center, fs) {
@@ -431,7 +448,7 @@ function renderWfAxis() {
         spans += `<span>${freqsMHz[i].toFixed(1)} MHz</span>`;
     }
     const depthRows = wfBuf[0] ? wfBuf[0].length / curBins : curRows;
-    const winMs = (depthRows * radioNfft * backendHopFrac() / curFs * 1e3).toFixed(0);
+    const winMs = (depthRows * rowHopSamples() / curFs * 1e3).toFixed(0);
     spans += `<span class="wf-axis-win">↕ ${winMs} ms</span>`;
     divs.forEach((d) => { d.innerHTML = spans; });
 }
@@ -933,7 +950,7 @@ function exportPng() {
     // Settings caption
     const ts  = new Date().toLocaleString();
     const capDepth = wfBuf[0] ? wfBuf[0].length / curBins : curRows;
-    const capWinMs = (capDepth * radioNfft * backendHopFrac() / curFs * 1e3).toFixed(0);
+    const capWinMs = (capDepth * rowHopSamples() / curFs * 1e3).toFixed(0);
     const capFft   = curBackend === "quicklook" ? `${radioNfft}` : `${radioNfft}→${curFftNfft}`;
     const cap = `${ts}  center ${(curCenter / 1e6).toFixed(3)} MHz  span ${(curFs / 1e6).toFixed(2)} MS/s  FFT ${capFft}  window ${capWinMs} ms`;
     ctx.fillStyle = "#d0d0d0";
@@ -962,10 +979,6 @@ resizeObserver.observe(document.getElementById("psd-container"));
 // Control wiring
 // ---------------------------------------------------------------------------
 
-function rowsForCurrentSettings() {
-    return rowsForWindow(curFs, radioNfft, windowMs, backendHopFrac());
-}
-
 function applyAnalysisMode() {
     document.body.classList.toggle("analysis-psd", analysisMode === "psd");
     document.body.classList.toggle("analysis-ssb", analysisMode === "ssb");
@@ -987,10 +1000,10 @@ function applyAnalysisMode() {
 // as a static select in the Capture panel, wired below.
 document.getElementById("nfft-sel").addEventListener("change", (e) => {
     const nfft = parseInt(e.target.value, 10);
-    radioNfft = nfft;   // the ONLY place radioNfft is updated
-    const ctrl = { nfft };
-    if (replaceMode) ctrl.rows = rowsForWindow(curFs, radioNfft, windowMs, backendHopFrac());
-    sendControl(ctrl);
+    radioNfft = nfft;   // updated here and by the /config re-sync (P2a-5)
+    // No client-side rows math: the server re-derives rows hop-aware from the
+    // stored first-class duration whenever nfft changes (P2a-4).
+    sendControl({ nfft });
 });
 
 // (P1-3) "Tune to band" was removed with the Radio bar. The PSD band-drag
@@ -1008,8 +1021,7 @@ document.getElementById("mode-sel").addEventListener("change", (e) => {
     replaceMode = e.target.value === "replace";
     // Clear display buffers so mode switch starts clean
     wfBuf[0] = wfBuf[1] = null;
-    const rows = replaceMode ? rowsForCurrentSettings() : 12;
-    sendControl({ rows });
+    sendTimeControl();
 });
 
 document.getElementById("analysis-sel").addEventListener("change", (e) => {
@@ -1017,12 +1029,12 @@ document.getElementById("analysis-sel").addEventListener("change", (e) => {
     applyAnalysisMode();
 });
 
-// Duration control (P1-4) — the single owner of the time axis. Presets are
-// available in both modes; the "custom…" option + number box are DAN-only. The
-// value is in ms; it drives `windowMs`, which sizes the display window exactly
-// like the old Window control (hop-aware `rowsForCurrentSettings`). In replace
-// (Boring) mode the server sends `rows`, so push the new count; in scroll (Cool)
-// mode the client display depth follows `windowMs` via computeDisplayDepth.
+// Duration control (P1-4/P2a-4) — the single owner of the time axis. Presets
+// are available in both modes; the "custom…" option + number box are DAN-only.
+// The value is in ms; it drives `windowMs`. In replace (Boring) mode it is sent
+// as a first-class `capture.duration` and the SERVER derives rows hop-aware; in
+// scroll (Cool) mode the client display depth follows `windowMs` via
+// computeDisplayDepth.
 const durSel         = document.getElementById("dur-sel");
 const durCustomLabel = document.getElementById("dur-custom-label");
 const durCustom      = document.getElementById("dur-custom");
@@ -1039,7 +1051,10 @@ function applyDuration() {
     }
     if (!isFinite(ms) || ms <= 0) return;
     windowMs = ms;
-    if (replaceMode) sendControl({ rows: rowsForCurrentSettings() });
+    // Replace mode: ship the duration itself — the server owns the hop-aware
+    // duration→rows mapping (P2a-4). Scroll mode: the display depth follows
+    // windowMs client-side; the server keeps streaming fixed 12-row chunks.
+    if (replaceMode) sendControl({ capture: { duration: windowMs / 1000 } });
     updateMeta();
 }
 

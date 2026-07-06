@@ -569,3 +569,29 @@ to last-good values` appears in the browser log), and frames keep flowing. Confi
 against the vendored striqt: revert restores last-good, escalates to defaults when last-good
 fails, and the reverted config computes again. **Verify [hardware]:** same, with the installed
 striqt build under live DMA load.
+
+### P2a-4 — Duration as a first-class, hop-aware server param
+**Files:** `live/striqt_web_server.py`, `live/web/app.js`
+**Changed:** Fixes the Phase-1 deviation where the client sent pre-computed `{rows}` because the
+server's `capture.duration→rows` math omitted the hop factor. `RadioConfig` gains `duration`
+(seconds; 0 = legacy rows-driven). A JSON `capture.duration` now maps straight through, and
+**rows are derived hop-aware from the final state of each update**
+(`round(duration · fs / row_hop(cfg))`, clamped to `max_live_rows`), re-deriving automatically
+whenever nfft / backend / `fractional_overlap` / sample_rate change — one owner, no drift. An
+explicit top-level `{"rows": N}` control reclaims rows ownership (zeroes `duration`); scroll
+(Cool) mode uses this for its fixed 12-row frame chunks. `make_capture` arms the radio with the
+owned duration (snapped to an integer sample count, which striqt's Capture validation requires).
+Client: the Duration control now sends `{capture:{duration}}` in replace mode (no client rows
+math); the nfft select sends bare `{nfft}` and lets the server re-derive; `sendTimeControl()`
+replaces the removed `rowsForCurrentSettings`/`rowsForWindow`/`backendHopFrac`. **The `↕ N ms`
+axis label, meta window label, and PNG caption are now computed from the header's exact
+`hop_size`** (`depthRows · hop_size / fs`) instead of the approximate `radioNfft·15/28` — which
+was off by 1.6 % (1024 vs the executed 1008) and would have been wrong for any non-default
+overlap. Scroll-mode display depth uses the same exact hop.
+
+**Verify [demo]:** applying `{"capture":{"duration":0.02}}` yields rows = round(0.02·fs/540) =
+569 at defaults; changing nfft to 2048 re-derives 284; overlap 0 re-derives 152; quicklook 150;
+an explicit rows control zeroes duration and later nfft changes leave rows alone; a 10 s request
+clamps to the ring bound (3744). All confirmed offline; on 8001 the `↕ ms` label matches the
+selected duration exactly. **Verify [hardware]:** the armed capture duration follows the
+Duration control (radio log line), and the label stays truthful across nfft changes.
