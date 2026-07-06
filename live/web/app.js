@@ -51,6 +51,10 @@ let curBinAvg   = 1;        // header bin_avg (frequency-bin averaging factor)
 let curHopSize  = null;     // header hop_size (samples of signal per display row, P2a-4)
 let lastBackendWarn = null; // dedups the "SSB unavailable" status warning
 let levels      = [-90, -10];
+// PSD-backend state (P2b-4): server-computed statistic traces
+let serverStats = null;     // header psd_stats — statistic behind each block row
+let curSpanMs   = null;     // header time_span_ms — true integrated span
+let uplotKind   = "std";    // which uPlot layout is built: "std" | "psd:<stats>"
 
 // Per-channel display buffers [rows_displayed × nfft], newest row at index 0
 const wfBuf   = { 0: null, 1: null };
@@ -61,6 +65,9 @@ const minBuf  = { 0: null, 1: null };
 const psdData = {
     mean: { 0: null, 1: null },
     max:  { 0: null, 1: null },
+    // PSD backend (P2b-4): server statistic traces
+    // { stats: [...], traces: {0: [Float32Array per stat], 1: [...]} }
+    server: null,
 };
 
 // FPS counter
@@ -116,10 +123,15 @@ function updateMeta() {
     const fftLabel  = curBackend === "quicklook"
         ? `${radioNfft}`
         : `${radioNfft}→${curFftNfft} (${curBins} bins × ${curBinAvg})`;
+    // PSD backend: block rows are statistics, not time — label the true
+    // integrated span from the header instead of the hop-derived window.
+    const winLabel  = (serverStats && curSpanMs != null)
+        ? `integration ${curSpanMs.toFixed(0)} ms (${serverStats.map(statLabel).join("/")})`
+        : `window ${winMs} ms (${depthRows} rows)`;
     metaEl.textContent = (
         `LIVE | center ${(curCenter / 1e6).toFixed(3)} MHz | ` +
         `span ${(curFs / 1e6).toFixed(2)} MS/s | ` +
-        `FFT ${fftLabel} | ${analysis} | ${mode} | window ${winMs} ms (${depthRows} rows) | ` +
+        `FFT ${fftLabel} | ${analysis} | ${mode} | ${winLabel} | ` +
         `scale ${scale} [${levels[0].toFixed(0)}, ${levels[1].toFixed(0)}] | ` +
         `${absRF ? "absolute RF" : "baseband"} | ${renderedFps.toFixed(0)} fps`
     );
@@ -307,7 +319,7 @@ function onFrame(data) {
 
     const { nfft, rows, channels, center, fs, gain, dtype, scale, backend,
             backend_requested, freqs_hz_f0, freqs_hz_step, fft_nfft, bin_avg,
-            hop_size } = header;
+            hop_size, psd_stats, time_span_ms } = header;
     let offset = 4 + hdrLen;
 
     // ── Parse blocks ──────────────────────────────────────────────────────
@@ -340,6 +352,8 @@ function onFrame(data) {
     curFftNfft = (fft_nfft !== undefined && fft_nfft !== null) ? fft_nfft : nfft;
     curBinAvg  = (bin_avg  !== undefined && bin_avg  !== null) ? bin_avg  : 1;
     curHopSize = (hop_size !== undefined && hop_size !== null) ? hop_size : null;
+    serverStats = (curBackend === "psd" && psd_stats && psd_stats.length) ? psd_stats : null;
+    curSpanMs   = (time_span_ms !== undefined && time_span_ms !== null) ? time_span_ms : null;
 
     // Honest backend reporting: warn once when the server had to substitute a
     // backend (e.g. SSB is unavailable at this sample rate) — LV-F2.
@@ -366,16 +380,24 @@ function onFrame(data) {
         // Clear hold/min on tuning change (freq-axis specific)
         holdBuf[0] = holdBuf[1] = null;
         minBuf[0]  = minBuf[1]  = null;
-        initUplot(freqsMHz);
+        uplotKind = null;   // force the renderer below to rebuild the right plot
         resetBand(freqsMHz);
     }
     curRows = rows;
 
     // ── Render ────────────────────────────────────────────────────────────
-    for (const ch of channels) {
-        updateWaterfall(ch, blocks[ch], rows, nfft, center, fs);
+    if (serverStats) {
+        // PSD backend (P2b-4): block rows are statistic traces, not time —
+        // draw them directly; no waterfall to update.
+        renderServerPsd(channels, blocks, rows, nfft);
+    } else {
+        psdData.server = null;
+        if (uplotKind !== "std") initUplot(freqsMHz);
+        for (const ch of channels) {
+            updateWaterfall(ch, blocks[ch], rows, nfft, center, fs);
+        }
+        updatePSD(channels, blocks, rows, nfft);
     }
-    updatePSD(channels, blocks, rows, nfft);
     updateBandMonitor(channels, blocks, rows, nfft);
     updateMeta();
 
@@ -575,6 +597,7 @@ function initUplot(freqs) {
     // initialize with all-null arrays (rendered as gaps) until the first frame.
     const empty  = Array.from({ length: 9 }, () => new Array(nfft).fill(null));
     uplot = new uPlot(opts, [Array.from(freqs), ...empty], container);
+    uplotKind = "std";
 
     // Preserve the crosshair toggle across re-inits (a retune rebuilds the plot,
     // which would otherwise silently reset the cursor to "on") — LV-R9a.
@@ -583,6 +606,149 @@ function initUplot(freqs) {
 
     // Set up band dragging on the uPlot canvas
     setupBandDrag();
+}
+
+// ---------------------------------------------------------------------------
+// PSD backend — server statistic traces (P2b-4)
+// ---------------------------------------------------------------------------
+//
+// With backend "psd" the server runs striqt's power_spectral_density and each
+// block row is one time_statistic trace (header psd_stats names them). The
+// plot is rebuilt with one series per (channel, statistic); uPlot's clickable
+// legend entries are the trace toggles, so the drawn set always reflects the
+// REAL statistic list instead of a fixed mean/max pair.
+
+function statLabel(stat) {
+    const q = parseFloat(stat);
+    if (isFinite(q) && String(q) === String(stat).trim()) {
+        return "p" + (q * 100).toFixed(q * 100 % 1 ? 1 : 0);
+    }
+    const s = String(stat);
+    return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+// Trace colors: mean stays the blue family, max the red family (matching the
+// classic pair); other statistics cycle a distinct palette. Index 0 = RX1
+// (saturated), 1 = RX2 (light shade of the same hue).
+const STAT_COLS = {
+    mean: ["#4ea3ff", "#9ac8ff"],
+    max:  ["#ff5252", "#ff9a9a"],
+    peak: ["#ff5252", "#ff9a9a"],
+    min:  ["#7986cb", "#c5cae9"],
+};
+const QUANT_COLS = [
+    ["#ffb74d", "#ffe0b2"],   // orange
+    ["#ba68c8", "#e1bee7"],   // violet
+    ["#4db6ac", "#b2dfdb"],   // teal
+    ["#f06292", "#f8bbd0"],   // pink
+    ["#dce775", "#f0f4c3"],   // lime
+    ["#90a4ae", "#cfd8dc"],   // blue-grey
+];
+
+function statColors(stats) {
+    let cycle = 0;
+    return stats.map((s) => {
+        const named = STAT_COLS[String(s).toLowerCase()];
+        if (named) return named;
+        return QUANT_COLS[cycle++ % QUANT_COLS.length];
+    });
+}
+
+function initUplotPsdStats(freqs, stats) {
+    const container = document.getElementById("psd-plot");
+    container.innerHTML = "";
+    const w = document.getElementById("psd-container").clientWidth || 900;
+    const cols = statColors(stats);
+
+    const series = [{}];
+    for (const ch of [0, 1]) {
+        stats.forEach((s, i) => {
+            series.push({
+                label:  `RX${ch + 1} ${statLabel(s)}`,
+                stroke: cols[i][ch],
+                width:  2,
+                show:   true,
+            });
+        });
+    }
+
+    const opts = {
+        width:  w,
+        height: 300,
+        title:  "Power Spectral Density — striqt statistics (RX1 + RX2)",
+        background: PSD_BG,
+        cursor: {
+            show:  true,
+            drag:  { x: false, y: false },
+            focus: { prox: 32 },
+        },
+        legend: { show: true, live: false },
+        scales: { x: { time: false }, y: { auto: true } },
+        axes: [
+            {
+                label:  "Frequency (MHz)",
+                stroke: PSD_FG, ticks: { stroke: PSD_FG }, grid: { stroke: "#243042" },
+                font:   "11px Menlo,monospace",
+            },
+            {
+                label:  psdYLabel(),
+                stroke: PSD_FG, ticks: { stroke: PSD_FG }, grid: { stroke: "#243042" },
+                font:   "11px Menlo,monospace",
+            },
+        ],
+        series,
+        hooks: { draw: [drawPsdOverlays] },
+    };
+
+    const nfft  = freqs.length;
+    const empty = Array.from({ length: series.length - 1 },
+                             () => new Array(nfft).fill(null));
+    uplot = new uPlot(opts, [Array.from(freqs), ...empty], container);
+    uplotKind = "psd:" + stats.join(",");
+
+    const crossChk = document.getElementById("cross-chk");
+    if (crossChk) uplot.cursor.show = crossChk.checked;
+    setupBandDrag();
+}
+
+function renderServerPsd(channels, blocks, rows, nfft) {
+    if (!freqsMHz || !serverStats) return;
+    const stats = serverStats;
+    const kind  = "psd:" + stats.join(",");
+    if (!uplot || uplotKind !== kind) initUplotPsdStats(freqsMHz, stats);
+
+    const nStats  = Math.min(stats.length, rows);
+    const freqArr = Array.from(freqsMHz);
+    const gaps    = new Array(nfft).fill(null);
+    const data    = [freqArr];
+    const traces  = { 0: [], 1: [] };
+    for (const ch of [0, 1]) {
+        const block = blocks[ch];
+        for (let s = 0; s < stats.length; s++) {
+            if (!block || s >= nStats) {
+                data.push(gaps);
+                traces[ch].push(null);
+                continue;
+            }
+            const tr = block.subarray(s * nfft, (s + 1) * nfft);
+            traces[ch].push(tr);
+            data.push(Array.from(tr));
+        }
+    }
+    uplot.setData(data);
+    psdData.server = { stats, traces };
+
+    // Peak markers from the most peak-like trace (max if present, else the
+    // last statistic), respecting the existing Peak marker checkbox.
+    if (peakMarker) {
+        let idx = stats.findIndex((s) => String(s).toLowerCase() === "max");
+        if (idx < 0) idx = stats.length - 1;
+        peakMarkerData = {
+            rx1: bestBin(traces[0][idx], freqArr),
+            rx2: bestBin(traces[1][idx], freqArr),
+        };
+    }
+    applyYspan();
 }
 
 function psdSeries(channels, blocks, rows, nfft) {
@@ -814,9 +980,20 @@ function updateBandMonitor(channels, blocks, rows, nfft) {
 
     const band = {}, qual = {};
     for (const ch of [0, 1]) {
-        const buf = wfBuf[ch];
+        // PSD backend (P2b-4): no waterfall window — integrate the mean trace
+        // (or the first statistic) instead of the display buffer.
+        let buf = null, depth = 0;
+        if (psdData.server) {
+            const stats = psdData.server.stats;
+            let idx = stats.findIndex((s) => String(s).toLowerCase() === "mean");
+            if (idx < 0) idx = 0;
+            buf = psdData.server.traces[ch] ? psdData.server.traces[ch][idx] : null;
+            depth = 1;
+        } else {
+            buf = wfBuf[ch];
+            depth = buf ? buf.length / nfft : 0;
+        }
         if (!buf) continue;
-        const depth = buf.length / nfft;
 
         // Correct linear-domain averaging (avoids the dB-averaging error)
         let sumInBand = 0, sumAll = 0;
@@ -936,6 +1113,41 @@ function setupBandDrag() {
 // ---------------------------------------------------------------------------
 
 function savePsdCsv() {
+    // PSD backend (P2b-4): export the server statistic traces, one column per
+    // (channel, statistic).
+    if (psdData.server && freqsMHz) {
+        const { stats, traces } = psdData.server;
+        const nfft = freqsMHz.length;
+        const cols = [];
+        for (const ch of [0, 1]) {
+            for (const s of stats) cols.push(`rx${ch + 1}_${statLabel(s).toLowerCase()}_db`);
+        }
+        const rows = [
+            `# backend=psd`,
+            `# fft_nfft=${curFftNfft}`,
+            `# bin_avg=${curBinAvg}`,
+            `# time_statistic=${stats.join(";")}`,
+            `# integration_span_ms=${curSpanMs != null ? curSpanMs.toFixed(3) : ""}`,
+            "freq_mhz," + cols.join(","),
+        ];
+        for (let i = 0; i < nfft; i++) {
+            const vals = [];
+            for (const ch of [0, 1]) {
+                for (let s = 0; s < stats.length; s++) {
+                    const tr = traces[ch] ? traces[ch][s] : null;
+                    vals.push(tr ? tr[i].toFixed(3) : "");
+                }
+            }
+            rows.push(`${freqsMHz[i].toFixed(6)},${vals.join(",")}`);
+        }
+        const blob = new Blob([rows.join("\n")], { type: "text/csv" });
+        const a    = document.createElement("a");
+        a.href     = URL.createObjectURL(blob);
+        a.download = `live_psd_stats_${Date.now()}.csv`;
+        a.click();
+        logMsg("PSD statistics CSV saved");
+        return;
+    }
     if (!freqsMHz || !psdData.mean[0]) {
         logMsg("No PSD data yet — try again after the first frame", "WARN");
         return;
@@ -1015,10 +1227,12 @@ resizeObserver.observe(document.getElementById("psd-container"));
 function applyAnalysisMode() {
     document.body.classList.toggle("analysis-psd", analysisMode === "psd");
     document.body.classList.toggle("analysis-ssb", analysisMode === "ssb");
-    // "PSD view" is a client-only waterfall-hide toggle (backend stays calibrated);
-    // Quicklook selects the raw per-bin FFT backend the server already supports.
+    // "PSD view" now selects the real striqt power_spectral_density backend
+    // (P2b-4) — server-computed statistic traces — instead of the old client-only
+    // waterfall-hide over the calibrated backend.
     const backend = analysisMode === "ssb" ? "ssb"
                   : analysisMode === "quicklook" ? "quicklook"
+                  : analysisMode === "psd" ? "psd"
                   : "calibrated";
     wfBuf[0] = wfBuf[1] = null;
     holdBuf[0] = holdBuf[1] = null;

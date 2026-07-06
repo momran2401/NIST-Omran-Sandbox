@@ -725,3 +725,30 @@ valid-name list; quantile 1.5 rejected at tier 1; editing psd window/overlap lea
 spectrogram block untouched and re-derives rows from the psd hop; `/config.analysis_psd`
 mirrors it all. **Verify [hardware]:** percentile traces over a real bursty signal order
 correctly (p50 < p95 < p99 < max) and the mean trace matches the old client-computed mean.
+
+### P2b-4 — PSD view: server statistic traces drawn in the browser
+**Files:** `live/web/app.js`, `live/web/style.css`
+**Changed:** The Analysis dropdown's "PSD view" now selects the real `psd` backend (P2b-3)
+instead of the old client-only waterfall-hide over calibrated. When frames carry `psd_stats`,
+the client rebuilds the uPlot with **one series per (channel, statistic)** — labels like
+`RX1 Mean / RX1 p95 / RX2 Max`, mean staying the blue family and max the red family, other
+statistics cycling a distinct palette — and draws the server-computed traces directly (no
+client-side mean/max recomputation). uPlot's clickable legend entries are the trace toggles,
+so the drawn set always follows the REAL `time_statistic` list rather than the fixed
+mean/max pair; the static Mean/Max swatch key is hidden in PSD mode (style.css). The meta
+line labels the true `integration N ms (Mean/p95/…)` span from the header instead of the
+hop-derived window; the peak marker follows the max-like trace (max if present, else the
+last statistic); the band monitor integrates the mean (or first) statistic trace; Save PSD
+CSV exports one column per (channel, statistic) with the statistic list and span in the
+header comments. Switching analyses rebuilds the correct plot layout both ways
+(`uplotKind` tracks it). Peak hold / min trace / RX1−RX2 diff operate on the client display
+window and have no effect in PSD mode (the server traces are the statistics).
+
+**Verify [demo]:** on a demo boot, a WS client switching to `backend: psd` with
+`time_statistic: mean, 0.5, 0.95, 0.99, max` receives (2, 5, 83) frames with
+`psd_stats`/`time_span_ms` headers, mean ≤ max and p50 ≤ p99 everywhere; a rejected `bogus`
+statistic leaves the 5-trace stream running (ack carries striqt's valid-name list);
+switching back to Spectrogram resumes 569-row calibrated frames (hop 540). In the browser:
+PSD mode shows one legend entry per statistic and clicking an entry hides that trace.
+**Verify [hardware]:** percentile traces over a real bursty band order sensibly and change
+when the statistic list is edited from the Analysis panel.
