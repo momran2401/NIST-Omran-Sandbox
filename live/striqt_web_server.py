@@ -728,9 +728,16 @@ def ssb_spectrogram(
     return fit_display_rows(spg, rows)
 
 
+# Snap the requested FFT size to a smooth multiple of 28 that is ALSO divisible
+# by 12 (so averaging_factor returns 12 consistently) and 7-smooth (2^a·3^b·7 —
+# fast scipy/pocketfft sizes). Avoids the slow non-power-of-2 sizes the old
+# round(n/28)·28 produced (1024→1036=2^2·7·37, 2048→2044=2^2·7·73), which drove
+# the calibrated cadence and made the bin-averaging factor non-monotonic.
+ALIGNED_NFFTS = (252, 504, 1008, 2016, 4032)   # 28·{9,18,36,72,144}
+
+
 def aligned_nfft(nfft: int) -> int:
-    nfft = max(28, int(nfft))
-    return max(28, int(round(nfft / 28)) * 28)
+    return min(ALIGNED_NFFTS, key=lambda n: abs(n - int(nfft)))
 
 
 def averaging_factor(nfft: int) -> int:
