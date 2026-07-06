@@ -507,3 +507,40 @@ units/attrs) apart from the half-bin axis correction above.
 bin_avg 12`, the same waterfall, and now include `hop_size: 540`; PSD tone positions unchanged
 (≤ half a raw bin shift from the axis correction). **Verify [hardware]:** live frames identical
 to pre-P2a at the default settings.
+
+### P2a-2 — Freedom-model validation (tiers 1–2) + extended ack
+**Files:** `live/striqt_web_server.py`
+**Changed:** Control messages gain an `"analysis"` block (`window`, `frequency_resolution`,
+`fractional_overlap`, `window_fill`, `integration_bandwidth`, `lo_bandstop`, `trim_stopband`),
+gated by the freedom model in `SharedConfig._validate_analysis` — the live radio can never
+receive a config that would crash the compute:
+- **Tier 1 (knowable → snap and tell):** `frequency_resolution` is a second view of the FFT size
+  (`cfg.nfft` owns it) — an edit snaps to the nearest `NFFT_CHOICES` size, and the executed
+  resolution (`fs / aligned_nfft`, the 28-multiple grid) is reported. `fractional_overlap` /
+  `window_fill` snap to the nearest k/nfft (integer overlap samples / integer zero-fill).
+  `integration_bandwidth` snaps to an integer multiple of the frequency resolution (accepts
+  `"auto"` = the old nfft-tracking default, and `"none"`). `lo_bandstop` accepts `"none"` and is
+  clamped to the sampled span. Every snap is reported as
+  `rounded: [{field, requested, used, reason}]`.
+- **Tier 2 (only striqt can judge):** each surviving field is applied one at a time onto a
+  scratch copy and judged by `scratch_validate_analysis` — the exact spec the Computer would run,
+  evaluated on a tiny 2-row zero buffer (a few nfft of samples, single channel), never touching
+  the live ring/acquirer. A striqt exception rejects that field with the striqt error text:
+  `rejected: [{field, requested, reason}]`; survivors still apply (per-field attribution).
+- The ack is now `{applied, ignored, reconnect, rounded, rejected}`; `ws_endpoint` sends a
+  human-readable summary plus the structured ack (`{"message": …, "ack": …}`) for any
+  capture/source/analysis message. Unknown analysis keys (Phase 2b params) are reported as
+  `ignored: ["analysis.<key>"]`, not dropped silently.
+- Analysis keys are **only** settable through the validated block — top-level occurrences are
+  stripped, so no client can bypass the gate. When a change alters the per-row hop (overlap/nfft/
+  backend), `rows` is re-clamped against `max_live_rows` so the Computer's `avail ≥ need` gate
+  stays reachable (no starved display).
+- Where the installed striqt lacks `striqt.analysis` (quicklook-only installs), tier 2 is a
+  no-op — tier 1 still applies, and the P2a-3 backstop covers the rest.
+
+**Verify [demo]:** on 8001, `{"analysis":{"window":"notawindow"}}` returns
+`rejected window: Invalid window name …` and the stream keeps running; `window_fill: "1/3"`
+applies (integral at nfft 1008); `frequency_resolution: 15000` rounds to 15238.1 with the nfft
+reason; `fractional_overlap: 0.464` snaps to `13/28`; a top-level `{"window": "boxcar"}` is
+stripped. All confirmed against the vendored striqt build. **Verify [hardware]:** same messages
+against the installed striqt build; a rejected value never interrupts the live feed.

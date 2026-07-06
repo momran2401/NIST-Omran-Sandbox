@@ -418,6 +418,109 @@ class NoCacheMiddleware:
 
 
 # ---------------------------------------------------------------------------
+# Freedom-model input parsing (P2a-2)
+# ---------------------------------------------------------------------------
+#
+# DAN mode has no input guardrail — the user can type anything — so these
+# parsers only normalize *structure* (they never judge legality). Legality is
+# decided by tier 1 (knowable rules → snap and tell) and tier 2 (striqt itself,
+# via scratch_validate_analysis) in SharedConfig._validate_analysis.
+
+# RadioConfig fields that are only settable through the validated "analysis"
+# block. Stripped from the top level of every control message so no client can
+# bypass the freedom model.
+ANALYSIS_CFG_KEYS = frozenset({
+    "window", "fractional_overlap", "window_fill",
+    "integration_bandwidth", "lo_bandstop", "trim_stopband",
+})
+
+
+def _parse_window(value):
+    """Normalize a window spec to what scipy get_window accepts: a name string
+    or a (name, float parameter) tuple. Accepts "kaiser, 11.88" shorthand and
+    the JSON list form ["kaiser", 11.88]. Raises ValueError on bad structure."""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError("window must not be empty")
+        if "," in text:
+            name, _, param = text.partition(",")
+            name, param = name.strip(), param.strip()
+            try:
+                return (name, float(param))
+            except ValueError:
+                raise ValueError(f"window parameter {param!r} is not a number")
+        return text
+    if isinstance(value, (list, tuple)) and len(value) == 2 and isinstance(value[0], str):
+        try:
+            return (str(value[0]), float(value[1]))
+        except (TypeError, ValueError):
+            raise ValueError(f"window parameter {value[1]!r} is not a number")
+    raise ValueError("window must be a name or name,parameter (scipy get_window spec)")
+
+
+def _parse_fraction(value) -> Fraction:
+    """Parse "13/28", a float, or an int into a Fraction. Raises ValueError."""
+    if isinstance(value, str):
+        value = value.strip()
+    try:
+        return Fraction(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        raise ValueError(f"{value!r} is not a fraction (use e.g. 13/28 or 0.464)")
+
+
+def _parse_optional_hz(value, *, auto_ok: bool = False):
+    """Parse a nullable Hz field: None/""/"none"/"off"/0 → None; "auto" → "auto"
+    (when allowed); otherwise a float Hz value. Raises ValueError."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("", "none", "null", "off"):
+            return None
+        if auto_ok and text == "auto":
+            return "auto"
+        value = text
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{value!r} is not a bandwidth in Hz"
+                         + (" (or 'auto'/'none')" if auto_ok else " (or 'none')"))
+    if value == 0:
+        return None
+    return value
+
+
+def scratch_validate_analysis(cfg: "RadioConfig"):
+    """
+    Tier 2 of the freedom model: judge a proposed analysis config the only way
+    that is always right — by asking striqt. Builds the exact Spectrogram spec
+    the live Computer would run and evaluates it on a tiny synthetic buffer
+    (2 STFT rows of zeros, single channel) WITHOUT touching the live ring or
+    acquirer. Returns the striqt error text when the config is illegal, or None
+    when it is safe to swap into the live stream.
+    """
+    if not _ANALYSIS_OK:
+        return None   # nothing to judge without striqt (quicklook-only install)
+    try:
+        sample_rate = float(cfg.sample_rate)
+        nfft   = aligned_nfft(cfg.nfft)
+        hop    = analysis_hop(nfft, cfg.fractional_overlap)
+        needed = calibrated_sample_count(nfft, 2, hop)
+        spec   = make_analysis_spec(cfg, nfft, sample_rate)   # construction may raise
+        capture = analysis_specs.Capture(
+            sample_rate=sample_rate,
+            duration=needed / sample_rate,
+            analysis_bandwidth=float(cfg.analysis_bandwidth),
+        )
+        tiny = np.zeros((1, needed), dtype=np.complex64)
+        striqt_shared.evaluate_spectrogram(tiny, capture, spec, dtype="float32", dB=True)
+    except Exception as e:
+        return str(e).strip() or type(e).__name__
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Shared radio config (thread-safe)
 # ---------------------------------------------------------------------------
 
@@ -487,10 +590,188 @@ class SharedConfig:
         with self._lock:
             return self._cfg.snapshot()
 
+    def _validate_analysis(self, update: dict):
+        """
+        Freedom-model gate (P2a-2) for the "analysis" block of a control message.
+        Never mutates the live config — returns (accepted, rounded, rejected,
+        ignored) where `accepted` maps RadioConfig keys to values that passed
+        tier 1 (knowable rules → snap and tell) AND tier 2 (striqt scratch
+        validation on a tiny buffer). `rounded`/`rejected` are the ack entries:
+        [{field, requested, used, reason}] / [{field, requested, reason}].
+        """
+        req = update.get("analysis") or {}
+        rounded, rejected, ignored = [], [], []
+        accepted = {}          # cfg key -> validated value
+        ack_field = {}         # cfg key -> field name reported in the ack
+
+        def tell(field, requested, used, reason):
+            rounded.append({
+                "field": field, "requested": requested, "used": used, "reason": reason,
+            })
+
+        # Effective radio params for THIS message (LV-R9b): validation must see
+        # the nfft/sample_rate/backend the message itself is applying (already
+        # mapped to the top level by the capture branch), not the stale cfg.
+        eff = self.snapshot()
+        try:
+            if update.get("sample_rate") is not None:
+                eff.sample_rate = float(
+                    max(1e6, min(_snap(float(update["sample_rate"]), RATES_HZ), 125e6))
+                )
+            if update.get("nfft") is not None:
+                eff.nfft = int(_snap(int(update["nfft"]), NFFT_CHOICES))
+            if update.get("backend") is not None:
+                backend = str(update["backend"]).strip().lower()
+                if backend in BACKENDS:
+                    eff.backend = backend
+        except (TypeError, ValueError):
+            pass
+        on_calibrated_grid = eff.backend in {"calibrated", "ssb"}
+
+        # --- frequency_resolution: the second view of nfft (tier 1) ----------
+        # cfg.nfft owns this quantity (P2a-1); an edit here snaps to the nearest
+        # FFT size and the executed resolution is reported back.
+        if req.get("frequency_resolution") is not None:
+            requested = req["frequency_resolution"]
+            try:
+                fr = float(requested)
+                if not (fr > 0 and math.isfinite(fr)):
+                    raise ValueError("frequency_resolution must be a positive, finite Hz value")
+                nfft_snap = int(_snap(eff.sample_rate / fr, NFFT_CHOICES))
+                eff.nfft = nfft_snap
+                accepted["nfft"] = nfft_snap
+                ack_field["nfft"] = "frequency_resolution"
+                executed_nfft = aligned_nfft(nfft_snap) if on_calibrated_grid else nfft_snap
+                used = eff.sample_rate / executed_nfft
+                if abs(used - fr) > 1e-6 * max(fr, 1.0):
+                    reason = f"FFT size owns this quantity; snapped to nfft {nfft_snap}"
+                    if executed_nfft != nfft_snap:
+                        reason += (f" (calibrated grid runs {executed_nfft}, "
+                                   f"a 28-multiple, for window_fill integrality)")
+                    tell("frequency_resolution", fr, used, reason)
+            except (TypeError, ValueError) as e:
+                rejected.append({"field": "frequency_resolution",
+                                 "requested": requested, "reason": str(e)})
+
+        # Denominator grid for fraction snapping: the FFT size striqt executes.
+        nfft_axis = aligned_nfft(eff.nfft) if on_calibrated_grid else int(eff.nfft)
+        freq_res  = eff.sample_rate / nfft_axis
+
+        # --- fractional_overlap / window_fill: snap to k/nfft (tier 1) -------
+        for key, lo_k, hi_k, why in (
+            ("fractional_overlap", 0, nfft_axis - 1,
+             "overlap must be an integer sample count (k/nfft) below 1"),
+            ("window_fill", 1, nfft_axis,
+             "(1 - window_fill) x nfft must be an integer zero-fill (k/nfft)"),
+        ):
+            if req.get(key) is None:
+                continue
+            requested = req[key]
+            try:
+                frac = _parse_fraction(requested)
+                k = min(max(round(frac * nfft_axis), lo_k), hi_k)
+                snapped = Fraction(k, nfft_axis)
+                accepted[key] = snapped
+                ack_field[key] = key
+                if snapped != frac:
+                    tell(key, str(requested), str(snapped), why)
+            except ValueError as e:
+                rejected.append({"field": key, "requested": requested, "reason": str(e)})
+
+        # --- integration_bandwidth: multiple of freq_res, "auto", or none ----
+        if "integration_bandwidth" in req and req["integration_bandwidth"] is not None:
+            requested = req["integration_bandwidth"]
+            try:
+                v = _parse_optional_hz(requested, auto_ok=True)
+                if v is None or isinstance(v, str):
+                    accepted["integration_bandwidth"] = v
+                else:
+                    if v < 0:
+                        raise ValueError("integration_bandwidth must be positive, 'auto', or 'none'")
+                    factor = min(max(1, round(v / freq_res)), nfft_axis)
+                    used = factor * freq_res
+                    accepted["integration_bandwidth"] = used
+                    if abs(used - v) > 1e-6 * max(v, 1.0):
+                        tell("integration_bandwidth", v, used,
+                             f"must be an integer multiple of the {freq_res:.1f} Hz "
+                             f"frequency resolution (striqt); using {factor} bins")
+                ack_field["integration_bandwidth"] = "integration_bandwidth"
+            except ValueError as e:
+                rejected.append({"field": "integration_bandwidth",
+                                 "requested": requested, "reason": str(e)})
+
+        # --- lo_bandstop: positive Hz within the sampled span, or none --------
+        if "lo_bandstop" in req and req["lo_bandstop"] is not None:
+            requested = req["lo_bandstop"]
+            try:
+                v = _parse_optional_hz(requested)
+                if v is not None:
+                    if v < 0:
+                        raise ValueError("lo_bandstop must be positive or 'none'")
+                    if v > eff.sample_rate:
+                        tell("lo_bandstop", v, eff.sample_rate,
+                             "cannot exceed the sampled span (sample_rate)")
+                        v = float(eff.sample_rate)
+                accepted["lo_bandstop"] = v
+                ack_field["lo_bandstop"] = "lo_bandstop"
+            except ValueError as e:
+                rejected.append({"field": "lo_bandstop",
+                                 "requested": requested, "reason": str(e)})
+
+        # --- trim_stopband / window --------------------------------------------
+        if "trim_stopband" in req and req["trim_stopband"] is not None:
+            accepted["trim_stopband"] = bool(req["trim_stopband"])
+            ack_field["trim_stopband"] = "trim_stopband"
+        if req.get("window") is not None:
+            try:
+                accepted["window"] = _parse_window(req["window"])
+                ack_field["window"] = "window"
+            except ValueError as e:
+                rejected.append({"field": "window",
+                                 "requested": req["window"], "reason": str(e)})
+
+        supported = ANALYSIS_CFG_KEYS | {"frequency_resolution"}
+        ignored = sorted(
+            f"analysis.{k}" for k, v in req.items()
+            if v is not None and k not in supported
+        )
+
+        # --- Tier 2: only striqt can judge — scratch-validate off-line -------
+        # Apply the accepted fields one at a time onto a working copy so a
+        # failure is attributed to the field that caused it; survivors keep
+        # applying. The live config is untouched until update() commits the
+        # survivors (never the rejects).
+        order = ("nfft", "window", "fractional_overlap", "window_fill",
+                 "integration_bandwidth", "lo_bandstop", "trim_stopband")
+        candidate = eff.snapshot()
+        survivors = {}
+        for key in (k for k in order if k in accepted):
+            trial = candidate.snapshot()
+            setattr(trial, key, accepted[key])
+            err = scratch_validate_analysis(trial)
+            if err is None:
+                candidate = trial
+                survivors[key] = accepted[key]
+            else:
+                field = ack_field.get(key, key)
+                rejected.append({"field": field,
+                                 "requested": req.get(field), "reason": err})
+                rounded[:] = [r for r in rounded if r["field"] != field]
+        return survivors, rounded, rejected, ignored
+
     def update(self, update: dict) -> dict:
-        """Apply key/value updates. Returns an ack {applied, ignored, reconnect}."""
+        """
+        Apply key/value updates. Returns an ack
+        {applied, ignored, reconnect, rounded, rejected}.
+        """
+        # Analysis params are only settable through the validated "analysis"
+        # block — strip top-level occurrences so nothing bypasses the freedom
+        # model (P2a-2).
+        update = {k: v for k, v in update.items() if k not in ANALYSIS_CFG_KEYS}
         ignored = []
         reconnect = []
+        rounded = []
+        rejected = []
         # Capture fields that map to a live radio parameter; the rest are rendered
         # by the editor but cannot be applied live — reported, not dropped (LV-F6).
         # The four capture knobs below share their name with the cfg field, so they
@@ -531,6 +812,16 @@ class SharedConfig:
             update = dict(update)
             update.update(mapped)
 
+        # Freedom-model analysis block (P2a-2): tier-1 snap + tier-2 striqt
+        # scratch validation. Only the survivors are merged into the update; the
+        # live cfg never sees a rejected value. Runs after the capture branch so
+        # it sees the nfft/sample_rate this same message is applying.
+        if "analysis" in update and isinstance(update["analysis"], dict):
+            survivors, rounded, rejected, analysis_ignored = self._validate_analysis(update)
+            ignored = sorted(set(ignored) | set(analysis_ignored))
+            update = dict(update)
+            update.update(survivors)
+
         if "source" in update and isinstance(update["source"], dict):
             reconnect = sorted(k for k, v in update["source"].items() if v is not None and k not in {
                 "receive_retries", "adc_overload_limit", "if_overload_limit", "gapless",
@@ -541,7 +832,7 @@ class SharedConfig:
         valid = {
             "center", "sample_rate", "gain", "nfft", "rows", "backend", "lo_null",
             "analysis_bandwidth", "lo_shift", "host_resample", "backend_sample_rate",
-        }
+        } | ANALYSIS_CFG_KEYS
         changes = []
         with self._lock:
             for key, value in update.items():
@@ -572,6 +863,10 @@ class SharedConfig:
                         continue
                     if value < 0:
                         continue   # 0 == track sample_rate; otherwise a positive rate
+                elif key in ANALYSIS_CFG_KEYS:
+                    # Already validated by _validate_analysis — only its
+                    # survivors reach this loop (top-level copies are stripped).
+                    pass
                 else:
                     value = int(value) if key in {"nfft", "rows"} else float(value)
                 # Clamp rows to what the ring can supply for the current backend/
@@ -595,11 +890,31 @@ class SharedConfig:
                 setattr(self._cfg, key, value)
                 changes.append((key, old, value))
             if changes:
+                # A new overlap/nfft/backend changes the per-row hop, which can
+                # push samples_needed(rows) past what the ring can supply — the
+                # Computer's avail >= need gate would then never pass and the
+                # display would starve. Re-clamp rows against the new hop.
+                max_rows = max_live_rows(self._cfg)
+                if self._cfg.rows > max_rows:
+                    old_rows = self._cfg.rows
+                    self._cfg.rows = max_rows
+                    changes.append(("rows", old_rows, max_rows))
                 self._dirty = True
         # Print outside the lock to avoid I/O inside a mutex
         for key, old, value in changes:
             print(f"[config] {key}: {old} -> {value}")
-        return {"applied": [k for k, _, _ in changes], "ignored": ignored, "reconnect": reconnect}
+        for entry in rounded:
+            print(f"[config] rounded {entry['field']}: "
+                  f"{entry['requested']} -> {entry['used']} ({entry['reason']})")
+        for entry in rejected:
+            print(f"[config] rejected {entry['field']}: {entry['reason']}")
+        return {
+            "applied":   [k for k, _, _ in changes],
+            "ignored":   ignored,
+            "reconnect": reconnect,
+            "rounded":   rounded,
+            "rejected":  rejected,
+        }
 
     def take_dirty(self):
         with self._lock:
@@ -1738,12 +2053,27 @@ async def ws_endpoint(ws: WebSocket):
             try:
                 ctrl = json.loads(text)
                 ack = _shared.update(ctrl)
-                # Acknowledge settings-editor applies so the UI can show what took
-                # effect vs what was ignored or needs a reconnect (LV-F6).
-                if isinstance(ctrl, dict) and ("capture" in ctrl or "source" in ctrl):
-                    await ws.send_text(json.dumps({"message":
-                        f"settings — applied {ack['applied']}; "
-                        f"ignored {ack['ignored']}; reconnect-only {ack['reconnect']}"}))
+                # Acknowledge settings/analysis applies so the UI can show what
+                # took effect vs what was rounded, rejected, ignored, or needs a
+                # reconnect (LV-F6, P2a-2). The structured ack rides along so
+                # app.js can surface rounded/rejected in the status line.
+                if isinstance(ctrl, dict) and (
+                    "capture" in ctrl or "source" in ctrl or "analysis" in ctrl
+                ):
+                    parts = [f"applied {ack['applied']}"]
+                    for r in ack.get("rounded", []):
+                        parts.append(
+                            f"rounded {r['field']}: {r['requested']} → {r['used']} ({r['reason']})"
+                        )
+                    for r in ack.get("rejected", []):
+                        parts.append(f"rejected {r['field']}: {r['reason']}")
+                    if ack.get("ignored"):
+                        parts.append(f"ignored {ack['ignored']}")
+                    if ack.get("reconnect"):
+                        parts.append(f"reconnect-only {ack['reconnect']}")
+                    await ws.send_text(json.dumps(
+                        {"message": "settings — " + "; ".join(parts), "ack": ack}
+                    ))
             except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
                 # A single malformed control message must never drop the (only)
                 # viewer connection (LV-R2).
