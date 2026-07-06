@@ -62,3 +62,27 @@ CPU per frame drops (log timestamps); assert in a REPL that `evaluate_spectrogra
 sample count returns ≥ rows STFT rows (it returns exactly `int((28/15)(N/nfft−1))+1`; with N as
 above that is ≥ rows). [demo] confirms frames identical + header rows unchanged; [hardware]
 confirms the per-frame CPU drop.
+
+---
+
+## Cluster 2 — Fidelity & labeling
+
+### LV-F1 — Ship the true frequency axis in the header; use it in the client
+**Files:** `live/striqt_web_server.py`, `live/web/app.js`
+**Changed:** The calibrated axis was invented client-side (`(g−73.5)/147·fs`), wrong by up to
+~103 kHz because striqt's DC-centered bin grouping drops edge bins. Now the server ships the true
+axis. Backend functions (`db_spectrogram`/`calibrated_spectrogram`/`ssb_spectrogram`) return
+`(blocks, meta)` with `meta = {fft_nfft, bin_avg}`; `compute_blocks` returns `(blocks, meta)`
+(adds executed `backend`); new `build_header(cfg, blocks, meta, demo)` centralizes the header and
+emits `fft_nfft`, `bin_avg`, `freqs_hz_step = bin_avg·fs/fft_nfft`, and `freqs_hz_f0` (=`-fs/2` for
+quicklook's fftshift convention, `-(bins-1)/2·step` for the DC-centered calibrated/ssb grid).
+`Acquirer.publish`/`DemoAcquirer._publish` and their call sites thread `meta`. Client:
+`buildFreqsMHz` prefers header `f0`/`step` (falls back to the old formula for old servers); axis
+rebuilds when `freqs_hz_step` changes. Verified locally: calibrated DC bin sits exactly at center;
++2.5 MHz demo tone lands within ½-step (60 kHz < 91 kHz) of 2.5 MHz; quicklook axis byte-identical
+to the old formula (stays exact).
+
+**Verify [demo]:** `--demo` (demo tones at exactly +2.5 MHz / −1.8 MHz on ch0): before, the
+calibrated peak marker read ≈ 2.45 MHz offset; after, 2.5 MHz ± ½ step. Browser console: the
+DC bin `freqsMHz[(curBins-1)/2]*1e6 - curCenter` must be ~0 in calibrated mode (with LV-W3's
+83-bin grid the DC bin is index 41); quicklook stays exact.

@@ -42,6 +42,8 @@ let curBins     = 1024;     // bins in the current frame's blocks (from header "
 let curRows     = 12;
 let curBackend  = "calibrated";
 let freqsMHz    = null;     // Float32Array(nfft)
+let curF0       = null;     // header freqs_hz_f0 (true axis origin, Hz baseband)
+let curStep     = null;     // header freqs_hz_step (true bin spacing, Hz)
 let levels      = [-90, -10];
 
 // Per-channel display buffers [rows_displayed × nfft], newest row at index 0
@@ -116,10 +118,19 @@ function updateMeta() {
 // Frequency axis helpers
 // ---------------------------------------------------------------------------
 
-function buildFreqsMHz(center, fs, nfft, absoluteRF) {
+function buildFreqsMHz(center, fs, nfft, absoluteRF, f0, step) {
     const f = new Float32Array(nfft);
+    if (f0 != null && step != null) {
+        // Server-supplied true axis: correct for the calibrated DC-centered bin
+        // groups (which drop edge bins) as well as the quicklook per-bin FFT.
+        for (let i = 0; i < nfft; i++) {
+            const baseHz = f0 + i * step;
+            f[i] = absoluteRF ? (center + baseHz) / 1e6 : baseHz / 1e6;
+        }
+        return f;
+    }
     for (let i = 0; i < nfft; i++) {
-        // fftshifted: bin 0 = most-negative freq, bin nfft/2 = DC
+        // fftshifted fallback (old servers): bin 0 = most-negative, nfft/2 = DC
         const baseHz = ((i - nfft / 2) / nfft) * fs;
         f[i] = absoluteRF ? (center + baseHz) / 1e6 : baseHz / 1e6;
     }
@@ -193,7 +204,8 @@ function onFrame(data) {
     const hdrText = new TextDecoder().decode(new Uint8Array(data, 4, hdrLen));
     const header  = JSON.parse(hdrText);
 
-    const { nfft, rows, channels, center, fs, gain, dtype, scale, backend } = header;
+    const { nfft, rows, channels, center, fs, gain, dtype, scale, backend,
+            freqs_hz_f0, freqs_hz_step } = header;
     let offset = 4 + hdrLen;
 
     // ── Parse blocks ──────────────────────────────────────────────────────
@@ -217,15 +229,19 @@ function onFrame(data) {
     }
 
     // ── Update state when tuning changes ──────────────────────────────────
+    const stepVal = (freqs_hz_step !== undefined && freqs_hz_step !== null) ? freqs_hz_step : null;
+    const f0Val   = (freqs_hz_f0   !== undefined && freqs_hz_f0   !== null) ? freqs_hz_f0   : null;
     const tuningChanged = (
-        nfft !== curBins || center !== curCenter || fs !== curFs
+        nfft !== curBins || center !== curCenter || fs !== curFs || stepVal !== curStep
     );
     curBackend = backend || curBackend;
     if (tuningChanged) {
         curBins   = nfft;
         curCenter = center;
         curFs     = fs;
-        freqsMHz  = buildFreqsMHz(center, fs, nfft, absRF);
+        curF0     = f0Val;
+        curStep   = stepVal;
+        freqsMHz  = buildFreqsMHz(center, fs, nfft, absRF, curF0, curStep);
         // Clear hold/min on tuning change (freq-axis specific)
         holdBuf[0] = holdBuf[1] = null;
         minBuf[0]  = minBuf[1]  = null;
@@ -904,7 +920,7 @@ document.getElementById("auto-color").addEventListener("change", (e) => {
 
 document.getElementById("abs-rf").addEventListener("change", (e) => {
     absRF    = e.target.checked;
-    freqsMHz = buildFreqsMHz(curCenter, curFs, curBins, absRF);
+    freqsMHz = buildFreqsMHz(curCenter, curFs, curBins, absRF, curF0, curStep);
     if (uplot && freqsMHz) initUplot(freqsMHz);
     resetBand(freqsMHz);
 });
@@ -1118,7 +1134,7 @@ bandLo = -curFs / 1e6 * 0.05;
 bandHi =  curFs / 1e6 * 0.05;
 
 // Init PSD with placeholder data so layout is in place
-freqsMHz = buildFreqsMHz(curCenter, curFs, curBins, absRF);
+freqsMHz = buildFreqsMHz(curCenter, curFs, curBins, absRF, curF0, curStep);
 initUplot(freqsMHz);
 
 connect();

@@ -638,7 +638,9 @@ def db_spectrogram(samples: np.ndarray, nfft: int, rows: int) -> np.ndarray:
     spec   = np.fft.fftshift(np.fft.fft(x, axis=-1), axes=-1)
     # Normalize by window power (proper PSD estimate)
     power  = (np.abs(spec) ** 2) / max(float(np.sum(window ** 2)), 1.0)
-    return (10.0 * np.log10(power + 1e-20)).astype(np.float32)
+    spg = (10.0 * np.log10(power + 1e-20)).astype(np.float32)
+    # Quicklook is a plain fftshifted per-bin FFT: fft_nfft = nfft, no averaging.
+    return spg, {"fft_nfft": int(nfft), "bin_avg": 1}
 
 
 def calibrated_spectrogram(
@@ -683,7 +685,8 @@ def calibrated_spectrogram(
     spg, _ = striqt_shared.evaluate_spectrogram(
         samples, capture, spec, dtype="float32", dB=True
     )
-    return fit_display_rows(np.asarray(spg, dtype=np.float32), rows)
+    blocks = fit_display_rows(np.asarray(spg, dtype=np.float32), rows)
+    return blocks, {"fft_nfft": int(nfft), "bin_avg": int(average_bins)}
 
 
 def ssb_spectrogram(
@@ -727,7 +730,11 @@ def ssb_spectrogram(
     spg = np.asarray(spg, dtype=np.float32)
     if spg.ndim == 4:
         spg = spg.reshape(spg.shape[0], spg.shape[1] * spg.shape[2], spg.shape[3])
-    return fit_display_rows(spg, rows)
+    blocks = fit_display_rows(spg, rows)
+    # Real SSB uses 15 kHz (subcarrier_spacing/2) resolution; best-effort axis
+    # params (this path is unreachable at the selectable sample rates — LV-F2).
+    ssb_nfft = max(1, round(sample_rate / (SSB_SUBCARRIER_SPACING / 2)))
+    return blocks, {"fft_nfft": int(ssb_nfft), "bin_avg": 1}
 
 
 # Snap the requested FFT size to a smooth multiple of 28 that is ALSO divisible
@@ -806,16 +813,67 @@ def ssb_grid_compatible(sample_rate: float) -> bool:
     return nfft > 0 and (13 * nfft) % 28 == 0
 
 
-def compute_blocks(samples: np.ndarray, cfg: RadioConfig) -> np.ndarray:
+def compute_blocks(samples: np.ndarray, cfg: RadioConfig):
     """
     Dispatch to the configured backend.
-    Returns (channels, rows, bins) float32.
+    Returns (blocks, meta): blocks is (channels, rows, bins) float32; meta carries
+    the per-frame axis parameters (fft_nfft, bin_avg) and the executed backend,
+    used by build_header to ship an honest frame header (LV-F1/F2).
     """
     if cfg.backend == "calibrated":
-        return calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
-    if cfg.backend == "ssb":
-        return ssb_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
-    return db_spectrogram(samples, cfg.nfft, cfg.rows)
+        blocks, meta = calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
+    elif cfg.backend == "ssb":
+        blocks, meta = ssb_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
+    else:
+        blocks, meta = db_spectrogram(samples, cfg.nfft, cfg.rows)
+    meta.setdefault("backend", cfg.backend)
+    return blocks, meta
+
+
+def build_header(cfg: RadioConfig, blocks: list, meta: dict, demo: bool = False) -> dict:
+    """
+    Assemble the frame header from cfg + the per-frame backend meta. Ships the
+    TRUE frequency axis (freqs_hz_f0/freqs_hz_step) and the executed backend so
+    the client never has to guess it (LV-F1/F2). fft_nfft/bin_avg disclose the
+    real FFT size and bin-averaging behind the reported `nfft` bin count.
+    """
+    first = np.asarray(blocks[0], dtype=np.float32)
+    rows, bins = first.shape
+    fs = float(cfg.sample_rate)
+    executed = str(meta.get("backend", cfg.backend))
+    fft_nfft = int(meta.get("fft_nfft", bins)) or int(bins)
+    bin_avg  = int(meta.get("bin_avg", 1)) or 1
+
+    # Frequency axis. Quicklook is a plain fftshifted FFT (bin 0 = -fs/2); the
+    # calibrated/ssb path DC-centers bin_avg-wide averaged groups, so their
+    # centers are symmetric about DC with step = bin_avg*fs/fft_nfft.
+    step = bin_avg * fs / fft_nfft
+    if executed == "quicklook":
+        f0 = -fs / 2.0
+    else:
+        f0 = -(bins - 1) / 2.0 * step
+
+    header = {
+        "center":        float(cfg.center),
+        "fs":            fs,
+        "gain":          float(cfg.gain),
+        "nfft":          int(bins),
+        "rows":          int(rows),
+        "shape":         [int(rows), int(bins)],
+        "channels":      list(CHANNELS),
+        "backend":       executed,
+        "fft_nfft":      fft_nfft,
+        "bin_avg":       bin_avg,
+        "freqs_hz_f0":   float(f0),
+        "freqs_hz_step": float(step),
+        "time":          time.time(),
+    }
+    requested = str(meta.get("backend_requested", executed))
+    if requested != executed:
+        header["backend_requested"] = requested
+    if demo:
+        header["demo"] = True
+    return header
 
 
 # ---------------------------------------------------------------------------
@@ -864,20 +922,8 @@ class Acquirer(threading.Thread):
                 return None, None
             return dict(self._latest_header), [b.copy() for b in self._latest_blocks]
 
-    def publish(self, cfg: RadioConfig, blocks: list):
-        first = np.asarray(blocks[0], dtype=np.float32)
-        rows, bins = first.shape
-        header = {
-            "center":   float(cfg.center),
-            "fs":       float(cfg.sample_rate),
-            "gain":     float(cfg.gain),
-            "nfft":     int(bins),
-            "rows":     int(rows),
-            "shape":    [int(rows), int(bins)],
-            "channels": list(CHANNELS),
-            "backend":  str(cfg.backend),
-            "time":     time.time(),
-        }
+    def publish(self, cfg: RadioConfig, blocks: list, meta: dict):
+        header = build_header(cfg, blocks, meta, demo=False)
         with self._pub_lock:
             self._latest_header = header
             self._latest_blocks = [np.asarray(b, dtype=np.float32) for b in blocks]
@@ -1092,8 +1138,8 @@ class Computer(threading.Thread):
                 continue
 
             try:
-                blocks = compute_blocks(samples, cfg)
-                self.acquirer.publish(cfg, [blocks[i] for i in range(blocks.shape[0])])
+                blocks, meta = compute_blocks(samples, cfg)
+                self.acquirer.publish(cfg, [blocks[i] for i in range(blocks.shape[0])], meta)
             except Exception as e:
                 print(f"[compute] error: {e}")
 
@@ -1130,21 +1176,8 @@ class DemoAcquirer(threading.Thread):
                 return None, None
             return dict(self._latest_header), [b.copy() for b in self._latest_blocks]
 
-    def _publish(self, cfg: RadioConfig, blocks: list):
-        first = np.asarray(blocks[0], dtype=np.float32)
-        rows, bins = first.shape
-        header = {
-            "center":   float(cfg.center),
-            "fs":       float(cfg.sample_rate),
-            "gain":     float(cfg.gain),
-            "nfft":     int(bins),
-            "rows":     int(rows),
-            "shape":    [int(rows), int(bins)],
-            "channels": list(CHANNELS),
-            "backend":  str(cfg.backend),
-            "time":     time.time(),
-            "demo":     True,
-        }
+    def _publish(self, cfg: RadioConfig, blocks: list, meta: dict):
+        header = build_header(cfg, blocks, meta, demo=True)
         with self._lock:
             self._latest_header = header
             self._latest_blocks = [np.asarray(b, dtype=np.float32) for b in blocks]
@@ -1179,8 +1212,8 @@ class DemoAcquirer(threading.Thread):
 
             samples = np.stack([sig0 + noise0, sig1 + noise1])
             try:
-                blocks = compute_blocks(samples, cfg)
-                self._publish(cfg, [blocks[i] for i in range(blocks.shape[0])])
+                blocks, meta = compute_blocks(samples, cfg)
+                self._publish(cfg, [blocks[i] for i in range(blocks.shape[0])], meta)
             except Exception as e:
                 print(f"[demo] compute error: {e}")
 
