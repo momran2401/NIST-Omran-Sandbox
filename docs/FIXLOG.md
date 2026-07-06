@@ -671,3 +671,29 @@ the exact P2a acks: `window: hann` applies; `notawindow` is rejected with the st
 `fractional_overlap: 0.463` rounds to `467/1008`; `frequency_resolution: 7000` snaps nfft
 1024→2048 with the 2016-grid note; `{"target": "nonsense"}` rejects with the known-target
 list. **Verify [hardware]:** none needed beyond P2a's (no behavior change).
+
+### P2b-2 — Spectrogram long tail: time_aperture through the freedom model
+**Files:** `live/striqt_web_server.py`, `live/web/index.html`, `live/web/app.js`
+**Changed:** Exposes the last striqt `Spectrogram` param the P2a panel didn't: `time_aperture`
+(binned RMS averaging along the time axis, seconds; `none` = off). New `RadioConfig.time_aperture`
+drives `make_analysis_spec`; tier-1 snaps a request to an integer multiple of the row hop period
+`(1-overlap)·nfft/fs` (striqt's own constraint), capped at one frame, and reports the snap; when a
+message moves the hop grid (nfft/overlap) under a standing aperture, the aperture is **re-snapped
+to the new grid and reported** instead of letting the next live frame throw. Tier-2 scratch runs
+now size their synthetic buffer so a configured aperture yields ≥1 averaged row (a 2-row buffer
+would judge legal apertures on an empty result), and a new `probe_reset` descriptor hook clears
+the stale aperture from the tier-2 working copy while nfft/overlap probe (it rides their hop grid;
+probing them with the stale aperture attached would falsely reject them). Compute path: striqt
+returns `rows//k` averaged rows for `k = round(aperture·fs/hop)`; `calibrated_spectrogram` now
+fits to that honest count and ships `hop_size = hop·k`, so the client's `↕ ms`/meta time labels
+stay exact with zero client changes. `/config` analysis block and the DAN Analysis panel gain the
+field (`time aperture (s)`, `none | s`). Backstop: `time_aperture` joins `ANALYSIS_CFG_KEYS` /
+`ANALYSIS_DEFAULTS`, so tier-3 revert covers it.
+
+**Verify [demo]:** offline harness on the vendored striqt: `0.001` s at defaults snaps to
+0.984375 ms (28 rows) with the hop-grid reason; a 20 ms frame computes (2, 20, 83) blocks with
+hop_size 15120 → 19.69 ms label; changing overlap re-derives rows and keeps the aperture legal;
+`none` clears; `banana` is rejected; a deliberately misaligned aperture forced into the compute
+raises striqt's multiple-of-hop error (tier-3 catches it live). **Verify [hardware]:** with a
+real signal, a 1 ms aperture visibly smooths the waterfall texture and reduces rows ~28×; the
+time label still matches the Duration control.

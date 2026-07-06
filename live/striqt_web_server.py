@@ -445,10 +445,19 @@ ANALYSIS_TARGETS = {
             "integration_bandwidth": "integration_bandwidth",
             "lo_bandstop":           "lo_bandstop",
             "trim_stopband":         "trim_stopband",
+            "time_aperture":         "time_aperture",
         },
         "virtual": ("frequency_resolution",),
+        # time_aperture goes last: its legality depends on the overlap/nfft this
+        # same message may be changing (the hop grid).
         "order": ("nfft", "window", "fractional_overlap", "window_fill",
-                  "integration_bandwidth", "lo_bandstop", "trim_stopband"),
+                  "integration_bandwidth", "lo_bandstop", "trim_stopband",
+                  "time_aperture"),
+        # Cleared on the tier-2 working copy while earlier fields probe, when a
+        # replacement value is accepted: time_aperture rides the hop grid that
+        # nfft/overlap define, so probing those with the STALE aperture attached
+        # would falsely reject them; the fresh aperture re-probes at its own turn.
+        "probe_reset": ("time_aperture",),
     },
 }
 
@@ -470,6 +479,7 @@ ANALYSIS_DEFAULTS = {
     "integration_bandwidth": DEFAULT_INTEGRATION_BW,
     "lo_bandstop":           DEFAULT_LO_BANDSTOP,
     "trim_stopband":         DEFAULT_TRIM_STOPBAND,
+    "time_aperture":         None,
 }
 
 
@@ -529,6 +539,27 @@ def _parse_optional_hz(value, *, auto_ok: bool = False):
     return value
 
 
+def _parse_optional_seconds(value):
+    """Parse a nullable seconds field: None/""/"none"/"off"/0 → None; otherwise
+    a positive, finite float in seconds. Raises ValueError."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("", "none", "null", "off"):
+            return None
+        value = text
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{value!r} is not a duration in seconds (or 'none')")
+    if value == 0:
+        return None
+    if not (value > 0 and math.isfinite(value)):
+        raise ValueError("must be a positive, finite duration in seconds (or 'none')")
+    return value
+
+
 def scratch_validate_spectrogram(cfg: "RadioConfig"):
     """
     Tier 2 of the freedom model: judge a proposed analysis config the only way
@@ -544,7 +575,13 @@ def scratch_validate_spectrogram(cfg: "RadioConfig"):
         sample_rate = float(cfg.sample_rate)
         nfft   = aligned_nfft(cfg.nfft)
         hop    = analysis_hop(nfft, cfg.fractional_overlap)
-        needed = calibrated_sample_count(nfft, 2, hop)
+        # Give the scratch run enough STFT rows that a configured time_aperture
+        # produces at least one averaged output row — otherwise a legal aperture
+        # would be judged on an empty result instead of striqt's real verdict.
+        rows_scratch = 2
+        if cfg.time_aperture:
+            rows_scratch = max(2, round(float(cfg.time_aperture) * sample_rate / hop))
+        needed = calibrated_sample_count(nfft, rows_scratch, hop)
         spec   = make_analysis_spec(cfg, nfft, sample_rate)   # construction may raise
         capture = analysis_specs.Capture(
             sample_rate=sample_rate,
@@ -616,6 +653,9 @@ class RadioConfig:
     integration_bandwidth: object = DEFAULT_INTEGRATION_BW
     lo_bandstop:           object = DEFAULT_LO_BANDSTOP
     trim_stopband:         bool   = DEFAULT_TRIM_STOPBAND
+    #   time_aperture:         None, or seconds of binned RMS averaging along the
+    #                          time axis (striqt requires a multiple of hop/fs)
+    time_aperture:         object = None
 
     def snapshot(self):
         return RadioConfig(
@@ -637,6 +677,7 @@ class RadioConfig:
             integration_bandwidth=self.integration_bandwidth,
             lo_bandstop=self.lo_bandstop,
             trim_stopband=bool(self.trim_stopband),
+            time_aperture=self.time_aperture,
         )
 
 
@@ -946,6 +987,9 @@ class SharedConfig:
         # applying. The live config is untouched until update() commits the
         # survivors (never the rejects).
         candidate = eff.snapshot()
+        for reset_key in spec.get("probe_reset", ()):
+            if reset_key in accepted:
+                setattr(candidate, reset_key, None)
         survivors = {}
         for key in (k for k in spec["order"] if k in accepted):
             trial = candidate.snapshot()
@@ -965,12 +1009,72 @@ class SharedConfig:
         """Dispatch tier-1 validation for one analysis target. Returns
         (accepted, ack_field, requested_map) keyed by RadioConfig key."""
         if target == "spectrogram":
-            return self._tier1_freq_fields(
+            accepted, ack_field, requested_map = self._tier1_freq_fields(
                 req, eff, cfg_prefix="", ack_prefix="",
                 on_calibrated_grid=on_calibrated_grid,
                 rounded=rounded, rejected=rejected,
             )
+            self._tier1_time_aperture(
+                req, eff, on_calibrated_grid,
+                accepted, ack_field, requested_map, rounded, rejected,
+            )
+            return accepted, ack_field, requested_map
         raise RuntimeError(f"no tier-1 validator for analysis target {target!r}")
+
+    def _tier1_time_aperture(self, req, eff, on_calibrated_grid,
+                             accepted, ack_field, requested_map, rounded, rejected):
+        """
+        Tier-1 rule for the spectrogram time_aperture (P2b-2): striqt requires an
+        integer multiple of the row hop period hop/fs — where hop follows the
+        overlap/nfft THIS message may also be changing. Snaps a requested value
+        to the nearest hop multiple within one frame; when the message moves the
+        hop grid under an existing aperture, the aperture is re-snapped to the
+        new grid (reported), instead of letting the next frame throw.
+        """
+        nfft_eff = accepted.get("nfft", eff.nfft)
+        nfft_axis = aligned_nfft(nfft_eff) if on_calibrated_grid else int(nfft_eff)
+        overlap = accepted.get("fractional_overlap", eff.fractional_overlap)
+        hop = analysis_hop(nfft_axis, overlap)
+        hop_period = hop / float(eff.sample_rate)
+
+        requested = req.get("time_aperture")
+        if requested is not None:
+            try:
+                v = _parse_optional_seconds(requested)
+                if v is None:
+                    accepted["time_aperture"] = None
+                else:
+                    k = min(max(1, round(v / hop_period)), max(1, int(eff.rows)))
+                    used = k * hop_period
+                    accepted["time_aperture"] = used
+                    if abs(used - v) > 1e-9 * max(v, hop_period):
+                        rounded.append({
+                            "field": "time_aperture", "requested": v, "used": used,
+                            "reason": (f"must be an integer multiple of the row hop "
+                                       f"(1-overlap)·nfft/fs = {hop_period * 1e3:.4f} ms, "
+                                       f"within one frame; using {k} rows"),
+                        })
+                ack_field["time_aperture"] = "time_aperture"
+                requested_map["time_aperture"] = requested
+            except ValueError as e:
+                rejected.append({"field": "time_aperture",
+                                 "requested": requested, "reason": str(e)})
+        elif eff.time_aperture and ("nfft" in accepted or "fractional_overlap" in accepted):
+            # Follow-along: the hop grid moved and the standing aperture no longer
+            # divides it — re-snap (and tell) rather than let the live frame throw.
+            samples = round(float(eff.time_aperture) * float(eff.sample_rate))
+            if samples % hop != 0:
+                k = max(1, round(samples / hop))
+                used = k * hop_period
+                accepted["time_aperture"] = used
+                ack_field["time_aperture"] = "time_aperture"
+                requested_map["time_aperture"] = eff.time_aperture
+                rounded.append({
+                    "field": "time_aperture",
+                    "requested": float(eff.time_aperture), "used": used,
+                    "reason": "this message changed the row hop; re-snapped the "
+                              "standing time_aperture to the new hop grid",
+                })
 
     def update(self, update: dict) -> dict:
         """
@@ -1354,6 +1458,7 @@ def make_analysis_spec(cfg: "RadioConfig", nfft: int, sample_rate: float):
         cfg.integration_bandwidth, nfft, sample_rate
     )
     lo = cfg.lo_bandstop
+    aperture = cfg.time_aperture
     return analysis_specs.Spectrogram(
         window=cfg.window,
         frequency_resolution=frequency_resolution,
@@ -1362,7 +1467,16 @@ def make_analysis_spec(cfg: "RadioConfig", nfft: int, sample_rate: float):
         integration_bandwidth=integration,
         trim_stopband=bool(cfg.trim_stopband),
         lo_bandstop=(float(lo) if lo else None),
+        time_aperture=(float(aperture) if aperture else None),
     )
+
+
+def time_aperture_bins(cfg: "RadioConfig", hop: int) -> int:
+    """STFT rows striqt averages into one output row for cfg.time_aperture
+    (1 = no time averaging). Mirrors striqt's round(time_aperture/hop_period)."""
+    if not cfg.time_aperture:
+        return 1
+    return max(1, round(float(cfg.time_aperture) * float(cfg.sample_rate) / max(1, hop)))
 
 
 def calibrated_spectrogram(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
@@ -1408,12 +1522,19 @@ def calibrated_spectrogram(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
     spg, _ = striqt_shared.evaluate_spectrogram(
         samples, capture, spec, dtype="float32", dB=True
     )
+    # time_aperture averages time_bins STFT rows into one output row (P2b-2):
+    # fewer rows come back, and each spans time_bins hops of signal. Fit to the
+    # honest averaged count and disclose the widened hop so the client's time
+    # labels stay exact.
+    time_bins = time_aperture_bins(cfg, hop)
+    rows_out  = max(1, rows // time_bins) if time_bins > 1 else rows
     blocks = fit_display_rows(
-        np.asarray(spg, dtype=np.float32), rows,
+        np.asarray(spg, dtype=np.float32), rows_out,
         bin_avg=average_bins, fft_nfft=nfft, sample_rate=sample_rate,
         lo_null=cfg.lo_null, lo_bandstop=cfg.lo_bandstop,
     )
-    meta = {"fft_nfft": int(nfft), "bin_avg": int(average_bins), "hop_size": int(hop)}
+    meta = {"fft_nfft": int(nfft), "bin_avg": int(average_bins),
+            "hop_size": int(hop * time_bins)}
     # Ship striqt's own frequency coordinates so the header axis is exact for ANY
     # analysis params (trim/averaging change the bin grid in ways the header's
     # symmetric-about-DC fallback can only approximate). Additive: build_header
@@ -2254,6 +2375,7 @@ def current_config():
             "integration_bandwidth": integration,
             "lo_bandstop":           float(cfg.lo_bandstop) if cfg.lo_bandstop else None,
             "trim_stopband":         bool(cfg.trim_stopband),
+            "time_aperture":         float(cfg.time_aperture) if cfg.time_aperture else None,
         },
         "backend": str(cfg.backend),
         "rows":    int(cfg.rows),

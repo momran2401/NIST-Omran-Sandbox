@@ -179,6 +179,9 @@
                 <label title="width nulled at DC by striqt: none, or Hz">LO bandstop (Hz)
                     <input type="text" id="an-lobandstop" placeholder="none | Hz">
                 </label>
+                <label title="binned RMS averaging along the time axis: none, or seconds (snaps to a multiple of the row hop)">time aperture (s)
+                    <input type="text" id="an-aperture" placeholder="none | s">
+                </label>
                 <label class="check" title="trim the frequency axis to the capture analysis_bandwidth (needs a finite analysis_bandwidth)"><input type="checkbox" id="an-trim"> trim stopband</label>
             </div>
             <button id="analysis-apply" type="button">Apply analysis</button>

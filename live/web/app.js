@@ -1426,6 +1426,7 @@ const ANALYSIS_FIELDS = [
     { id: "an-fill",       key: "window_fill" },
     { id: "an-integ",      key: "integration_bandwidth" },
     { id: "an-lobandstop", key: "lo_bandstop" },
+    { id: "an-aperture",   key: "time_aperture" },
     { id: "an-trim",       key: "trim_stopband", checkbox: true },
 ];
 
