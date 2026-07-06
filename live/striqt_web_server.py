@@ -390,6 +390,7 @@ class RadioConfig:
     nfft:        int   = DEFAULT_NFFT
     rows:        int   = DEFAULT_ROWS
     backend:     str   = SPEC_BACKEND
+    lo_null:     bool  = True
 
     def snapshot(self):
         return RadioConfig(
@@ -399,6 +400,7 @@ class RadioConfig:
             nfft=int(self.nfft),
             rows=int(self.rows),
             backend=str(self.backend),
+            lo_null=bool(self.lo_null),
         )
 
 
@@ -451,7 +453,7 @@ class SharedConfig:
             if reconnect:
                 print(f"[config] source changes require reconnect: {reconnect}")
 
-        valid = {"center", "sample_rate", "gain", "nfft", "rows", "backend"}
+        valid = {"center", "sample_rate", "gain", "nfft", "rows", "backend", "lo_null"}
         changes = []
         with self._lock:
             for key, value in update.items():
@@ -461,6 +463,8 @@ class SharedConfig:
                     value = str(value).strip().lower()
                     if value not in BACKENDS:
                         continue
+                elif key == "lo_null":
+                    value = bool(value)
                 else:
                     value = int(value) if key in {"nfft", "rows"} else float(value)
                 # Clamp rows so a misbehaving browser can't overload the radio
@@ -652,11 +656,12 @@ def db_spectrogram(samples: np.ndarray, nfft: int, rows: int) -> np.ndarray:
 
 
 def calibrated_spectrogram(
-    samples: np.ndarray, nfft: int, rows: int, sample_rate: float
-) -> np.ndarray:
+    samples: np.ndarray, nfft: int, rows: int, sample_rate: float, lo_null: bool = True
+) -> tuple:
     """
     striqt-calibrated PSD spectrogram with symbol-style overlap/fill and
-    frequency-bin averaging. Returns (channels, rows, bins) float32.
+    frequency-bin averaging. Returns (blocks, meta) — blocks (channels, rows,
+    bins) float32, meta {fft_nfft, bin_avg}.
     """
     if not _ANALYSIS_OK:
         raise RuntimeError(f"calibrated backend unavailable: {_ANALYSIS_ERR!r}")
@@ -693,16 +698,20 @@ def calibrated_spectrogram(
     spg, _ = striqt_shared.evaluate_spectrogram(
         samples, capture, spec, dtype="float32", dB=True
     )
-    blocks = fit_display_rows(np.asarray(spg, dtype=np.float32), rows)
+    blocks = fit_display_rows(
+        np.asarray(spg, dtype=np.float32), rows,
+        bin_avg=average_bins, fft_nfft=nfft, sample_rate=sample_rate, lo_null=lo_null,
+    )
     return blocks, {"fft_nfft": int(nfft), "bin_avg": int(average_bins)}
 
 
 def ssb_spectrogram(
-    samples: np.ndarray, nfft: int, rows: int, sample_rate: float
-) -> np.ndarray:
+    samples: np.ndarray, nfft: int, rows: int, sample_rate: float, lo_null: bool = True
+) -> tuple:
     """
     5G SSB spectrogram path from striqt. The returned SSB block and symbol axes
     are flattened to the dashboard's existing rows x bins frame contract.
+    Returns (blocks, meta).
     """
     if not _ANALYSIS_OK:
         raise RuntimeError(f"SSB backend unavailable: {_ANALYSIS_ERR!r}")
@@ -734,14 +743,17 @@ def ssb_spectrogram(
         # The live viewer's power-of-two sample-rate/FFT controls are not
         # always compatible with the strict 30 kHz SSB grid. Keep the selector
         # useful by falling back to the same 13/28, 15/28 averaged grid.
-        return calibrated_spectrogram(samples, nfft, rows, sample_rate)
+        return calibrated_spectrogram(samples, nfft, rows, sample_rate, lo_null=lo_null)
     spg = np.asarray(spg, dtype=np.float32)
     if spg.ndim == 4:
         spg = spg.reshape(spg.shape[0], spg.shape[1] * spg.shape[2], spg.shape[3])
-    blocks = fit_display_rows(spg, rows)
     # Real SSB uses 15 kHz (subcarrier_spacing/2) resolution; best-effort axis
     # params (this path is unreachable at the selectable sample rates — LV-F2).
     ssb_nfft = max(1, round(sample_rate / (SSB_SUBCARRIER_SPACING / 2)))
+    blocks = fit_display_rows(
+        spg, rows,
+        bin_avg=1, fft_nfft=ssb_nfft, sample_rate=sample_rate, lo_null=lo_null,
+    )
     return blocks, {"fft_nfft": int(ssb_nfft), "bin_avg": 1}
 
 
@@ -778,7 +790,15 @@ def calibrated_sample_count(nfft: int, rows: int) -> int:
     return int(rows * hop + (nfft - hop))
 
 
-def fit_display_rows(spg: np.ndarray, rows: int) -> np.ndarray:
+def fit_display_rows(
+    spg: np.ndarray,
+    rows: int,
+    *,
+    bin_avg: int = 1,
+    fft_nfft=None,
+    sample_rate=None,
+    lo_null: bool = True,
+) -> np.ndarray:
     """Crop/pad a striqt spectrogram to the dashboard row contract."""
     spg = np.asarray(spg, dtype=np.float32)
     if spg.ndim != 3:
@@ -794,12 +814,23 @@ def fit_display_rows(spg: np.ndarray, rows: int) -> np.ndarray:
             )
             spg = np.concatenate([pad, spg], axis=1)
 
-    # Null the LO leakage region after any frequency bin averaging.
-    if spg.shape[2] >= 5:
+    # Null the LO leakage region, sized to the striqt bandstop instead of a fixed
+    # ±2 bins (which hid up to ~3.7 MHz of real spectrum at coarse FFTs). Optional
+    # via the lo_null flag so the center can be revealed (LV-F8).
+    if lo_null and spg.shape[2] >= 3 and fft_nfft and sample_rate:
+        step = max(1, bin_avg) * float(sample_rate) / float(fft_nfft)   # Hz per averaged bin
+        half = max(1, math.ceil((SSB_LO_BANDSTOP / 2) / step))
         c = spg.shape[-1] // 2
-        lo = max(0, c - 2)
-        hi = min(spg.shape[-1], c + 3)
+        lo = max(0, c - half)
+        hi = min(spg.shape[-1], c + half + 1)
         spg[:, :, lo:hi] = np.nanmin(spg, axis=-1, keepdims=True)
+
+    # ALWAYS scrub remaining NaNs (striqt's null_lo leaves an all-NaN DC group) to
+    # the per-row min so the quantizer and client never see NaN garbage (LV-F8/R4).
+    if np.isnan(spg).any():
+        row_min = np.nanmin(np.where(np.isnan(spg), np.float32(np.inf), spg), axis=-1, keepdims=True)
+        row_min = np.where(np.isfinite(row_min), row_min, np.float32(-200.0))
+        spg = np.where(np.isnan(spg), row_min, spg).astype(np.float32)
     return spg
 
 
@@ -833,13 +864,13 @@ def compute_blocks(samples: np.ndarray, cfg: RadioConfig):
         # SSB requires a sample rate on the 420 kHz grid; none of the selectable
         # rates qualify, so skip the striqt call (which would raise and fall back
         # every frame) and run calibrated directly, reporting it honestly (LV-F2).
-        blocks, meta = calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
+        blocks, meta = calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate, lo_null=cfg.lo_null)
         executed = "calibrated"
     elif requested == "calibrated":
-        blocks, meta = calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
+        blocks, meta = calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate, lo_null=cfg.lo_null)
         executed = "calibrated"
     elif requested == "ssb":
-        blocks, meta = ssb_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
+        blocks, meta = ssb_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate, lo_null=cfg.lo_null)
         executed = "ssb"
     else:
         blocks, meta = db_spectrogram(samples, cfg.nfft, cfg.rows)

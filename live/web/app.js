@@ -1004,6 +1004,10 @@ document.getElementById("auto-color").addEventListener("change", (e) => {
     autoColor = e.target.checked;
 });
 
+document.getElementById("lo-null").addEventListener("change", (e) => {
+    sendControl({ lo_null: e.target.checked });   // server-side DC-null toggle (LV-F8)
+});
+
 document.getElementById("abs-rf").addEventListener("change", (e) => {
     absRF    = e.target.checked;
     freqsMHz = buildFreqsMHz(curCenter, curFs, curBins, absRF, curF0, curStep);

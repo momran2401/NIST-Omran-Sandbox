@@ -173,3 +173,19 @@ with a text-shadow for legibility over the waterfall (window span highlighted).
 
 **Verify [demo]:** labels appear under each waterfall and match the uPlot PSD x-axis extremes;
 changing center/span/Absolute-RF updates them.
+
+### LV-F8 — DC-null: proportional width, optional toggle, unconditional NaN scrub
+**Files:** `live/striqt_web_server.py`, `live/web/index.html`, `live/web/app.js`
+**Changed:** `fit_display_rows` now sizes the LO-null half-width as
+`max(1, ceil((SSB_LO_BANDSTOP/2) / (bin_avg·fs/fft_nfft)))` bins (was a fixed ±2 bins that hid up
+to ~3.7 MHz at coarse FFTs) — threaded `bin_avg`/`fft_nfft`/`sample_rate`/`lo_null` from the
+calibrated/ssb backends. It **always** scrubs any remaining NaNs (striqt's `null_lo` leaves an
+all-NaN DC group) to the per-row min, so the quantizer/client never see NaN garbage even with the
+null disabled. Added `lo_null` to `RadioConfig`+`SharedConfig.update` (WS-controllable, default
+True) gating only the overwrite, and a "LO null" checkbox in the Display group wired to send
+`{lo_null}`. Unit-tested: null shrinks 5→3 bins at FFT 1024, and no NaN leaks with the null on
+**or** off (no RuntimeWarning).
+
+**Verify [demo]:** calibrated mode — the checkbox toggles the center stripe; at FFT 256 the null
+shrinks from 5 bins toward the minimum; with the null off, no NaN garbage appears under
+`--quantize`.
