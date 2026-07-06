@@ -349,3 +349,29 @@ verification date/section instead.
 **Verify [docs]:** `grep spectrogram_cache CLAUDE.md` returns only the debunking note (nothing
 prescriptive); the "Always clear …" instruction is gone; `bug_report.md` starts with the HISTORICAL
 banner. (Confirmed here.)
+
+---
+
+# Phase 1 — Consolidate the control surface
+
+Make the schema-driven Capture Settings form the single place to tune the radio: retire the
+redundant "Radio (AIR-T)" bar, wire four rendered-but-ignored capture fields, switch the time
+control to a duration, and remove the artificial 300-row cap that made duration inert. One
+change per commit (`P1-1 … P1-5`). Edits under `live/` only; `striqt/` untouched.
+
+### P1-1 — LO-null checkbox sense (verified already correct — no inversion)
+**Files:** `docs/FIXLOG.md` (docs only — no code change)
+**Finding as briefed:** `#lo-null` was said to behave backwards (checked *shows* the spike,
+unchecked *hides* it). **Verified in the current tree it is already correct** and needs no change:
+the checkbox is `checked` by default, its handler sends `{lo_null: e.target.checked}`, `RadioConfig.lo_null`
+defaults `True`, and `fit_display_rows` overwrites the center bins with the per-row min **only when
+`lo_null` is truthy**. So `checked ⇒ lo_null=true ⇒ spike hidden` already holds — this is the
+LV-F8 behaviour. A deterministic check of the null logic confirms it: with a bright center bin,
+`lo_null=True` drives that bin to the row minimum (hidden) and `lo_null=False` leaves it at 0 dB
+(visible). **Inverting the sense would re-break it** (checked would reveal the spike), so no code
+was changed — this matches CLAUDE.md's warning that the old "known bugs" notes describe a pre-fix
+state. The box stays checked by default.
+
+**Verify [demo]:** calibrated mode — box checked → center stripe blanked; unchecked → the LO
+spike (real hardware DC leakage) is visible at band center. In `--demo` (no synthetic DC tone)
+the center stripe darkens to the row-min when checked and shows noise when unchecked.
