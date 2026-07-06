@@ -455,9 +455,13 @@ class SharedConfig:
             if capture.get("duration") is not None:
                 try:
                     with self._lock:
-                        nfft = self._cfg.nfft
-                        sample_rate = self._cfg.sample_rate
-                    rows = round(float(capture["duration"]) * sample_rate / max(nfft, 1))
+                        cur_nfft = self._cfg.nfft
+                        cur_rate = self._cfg.sample_rate
+                    # Map duration→rows using values from THIS message when it also
+                    # changes them, not the pre-update cfg (LV-R9b).
+                    nfft        = capture.get("nfft") or cur_nfft
+                    sample_rate = capture.get("sample_rate") or cur_rate
+                    rows = round(float(capture["duration"]) * float(sample_rate) / max(int(nfft), 1))
                     mapped["rows"] = max(1, min(rows, MAX_LIVE_ROWS))
                 except Exception:
                     pass

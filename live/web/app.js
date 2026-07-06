@@ -510,6 +510,11 @@ function initUplot(freqs) {
     const empty  = Array.from({ length: 9 }, () => new Array(nfft).fill(null));
     uplot = new uPlot(opts, [Array.from(freqs), ...empty], container);
 
+    // Preserve the crosshair toggle across re-inits (a retune rebuilds the plot,
+    // which would otherwise silently reset the cursor to "on") — LV-R9a.
+    const crossChk = document.getElementById("cross-chk");
+    if (crossChk) uplot.cursor.show = crossChk.checked;
+
     // Set up band dragging on the uPlot canvas
     setupBandDrag();
 }
@@ -984,7 +989,11 @@ document.getElementById("nfft-sel").addEventListener("change", (e) => {
 });
 
 document.getElementById("tune-btn").addEventListener("click", () => {
-    if (bandLo === null || bandHi === null || !absRF) return;
+    if (bandLo === null || bandHi === null) return;
+    if (!absRF) {
+        logMsg("Tune to band needs Absolute RF enabled", "WARN");   // LV-R9c
+        return;
+    }
     const lo = Math.min(bandLo, bandHi);
     const hi = Math.max(bandLo, bandHi);
     const newCenter = ((lo + hi) / 2) * 1e6;

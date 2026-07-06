@@ -303,3 +303,16 @@ is still present. Verified the decision table (plain-http→no Secure; https/tun
 **Verify [demo]:** with `RADIO_USER`/`RADIO_PASS` set, `curl -v http://localhost:8001/ -u user:pass`
 shows `Set-Cookie` without `Secure`; via an HTTPS tunnel the `Secure` attribute is present. On an
 iPhone on LAN http, page login → live frames.
+
+### LV-R9 — Minor state/logic nits (3 one-liners)
+**Files:** `live/web/app.js`, `live/striqt_web_server.py`
+**Changed:** (a) `initUplot` re-applies `uplot.cursor.show = cross-chk.checked` after rebuilding the
+plot, so the crosshair toggle no longer silently resets to "on" on every retune. (b)
+`SharedConfig.update` maps `duration→rows` using `capture.get("sample_rate")`/`capture.get("nfft")`
+from the same message when present (falling back to current cfg), instead of the pre-update values.
+(c) The "Tune to band" handler logs `"Tune to band needs Absolute RF enabled"` when Absolute RF is
+off, instead of silently no-op'ing.
+
+**Verify [demo]:** (a) toggle the crosshair off, change center — it stays off. (b) via Load JSON +
+Apply, a sweep that sets both sample_rate and duration yields the rows count for the new rate. (c)
+turn off Absolute RF and click Tune to band — the log shows the warning.
