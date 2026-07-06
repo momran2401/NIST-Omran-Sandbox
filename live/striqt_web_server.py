@@ -412,6 +412,13 @@ class RadioConfig:
     rows:        int   = DEFAULT_ROWS
     backend:     str   = SPEC_BACKEND
     lo_null:     bool  = True
+    # Capture knobs surfaced by the schema editor (P1-2). Defaults reproduce the
+    # values make_capture used to hardcode, so behaviour is unchanged until the
+    # user edits them. backend_sample_rate == 0 means "track sample_rate".
+    analysis_bandwidth:  float = float("inf")
+    lo_shift:            str   = "none"
+    host_resample:       bool  = False
+    backend_sample_rate: float = 0.0
 
     def snapshot(self):
         return RadioConfig(
@@ -422,6 +429,10 @@ class RadioConfig:
             rows=int(self.rows),
             backend=str(self.backend),
             lo_null=bool(self.lo_null),
+            analysis_bandwidth=float(self.analysis_bandwidth),
+            lo_shift=str(self.lo_shift),
+            host_resample=bool(self.host_resample),
+            backend_sample_rate=float(self.backend_sample_rate),
         )
 
 
@@ -442,7 +453,12 @@ class SharedConfig:
         reconnect = []
         # Capture fields that map to a live radio parameter; the rest are rendered
         # by the editor but cannot be applied live — reported, not dropped (LV-F6).
-        capture_mapped = {"center_frequency", "sample_rate", "gain", "duration"}
+        # The four capture knobs below share their name with the cfg field, so they
+        # pass straight through (P1-2); they take effect on the next re-arm.
+        passthru_capture = {
+            "analysis_bandwidth", "lo_shift", "host_resample", "backend_sample_rate",
+        }
+        capture_mapped = {"center_frequency", "sample_rate", "gain", "duration"} | passthru_capture
         if "capture" in update and isinstance(update["capture"], dict):
             capture = update["capture"]
             mapped = {}
@@ -452,6 +468,9 @@ class SharedConfig:
                 mapped["sample_rate"] = capture["sample_rate"]
             if capture.get("gain") is not None:
                 mapped["gain"] = capture["gain"]
+            for key in passthru_capture:
+                if capture.get(key) is not None:
+                    mapped[key] = capture[key]
             if capture.get("duration") is not None:
                 try:
                     with self._lock:
@@ -478,7 +497,10 @@ class SharedConfig:
             if reconnect:
                 print(f"[config] source changes require reconnect: {reconnect}")
 
-        valid = {"center", "sample_rate", "gain", "nfft", "rows", "backend", "lo_null"}
+        valid = {
+            "center", "sample_rate", "gain", "nfft", "rows", "backend", "lo_null",
+            "analysis_bandwidth", "lo_shift", "host_resample", "backend_sample_rate",
+        }
         changes = []
         with self._lock:
             for key, value in update.items():
@@ -488,8 +510,27 @@ class SharedConfig:
                     value = str(value).strip().lower()
                     if value not in BACKENDS:
                         continue
-                elif key == "lo_null":
+                elif key in {"lo_null", "host_resample"}:
                     value = bool(value)
+                elif key == "lo_shift":
+                    # striqt LOShift is Literal['left','right','none'].
+                    value = str(value).strip().lower()
+                    if value not in {"left", "right", "none"}:
+                        continue
+                elif key == "analysis_bandwidth":
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if not (math.isinf(value) or value > 0):
+                        continue   # must be a positive bandwidth or inf (no limit)
+                elif key == "backend_sample_rate":
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if value < 0:
+                        continue   # 0 == track sample_rate; otherwise a positive rate
                 else:
                     value = int(value) if key in {"nfft", "rows"} else float(value)
                 # Clamp rows so a misbehaving browser can't overload the radio
@@ -642,16 +683,18 @@ def make_source():
     return Airstack1Source.from_spec(source_spec)
 
 def make_capture(cfg):
+    # port stays fixed at CHANNELS — the two-waterfall UI depends on both RX ports
+    # (P1-2). The other four knobs are now driven by the schema editor / cfg.
     return specs.SoapyCapture(
         port=CHANNELS,
         center_frequency=cfg.center,
         gain=tuple([cfg.gain] * len(CHANNELS)),
         duration=max(cfg.rows * cfg.nfft / cfg.sample_rate, 1e-3),
         sample_rate=cfg.sample_rate,
-        backend_sample_rate=cfg.sample_rate,
-        host_resample=False,
-        analysis_bandwidth=float("inf"),
-        lo_shift="none",
+        backend_sample_rate=(cfg.backend_sample_rate or cfg.sample_rate),
+        host_resample=cfg.host_resample,
+        analysis_bandwidth=cfg.analysis_bandwidth,
+        lo_shift=cfg.lo_shift,
     )
 
 

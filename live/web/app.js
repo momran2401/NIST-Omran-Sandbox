@@ -1114,9 +1114,12 @@ document.getElementById("yspan-sel").addEventListener("change", (e) => {
 // ---------------------------------------------------------------------------
 
 const SOURCE_SKIP = new Set(["receive_retries", "adc_overload_limit", "if_overload_limit", "gapless"]);
+// `port` is intentionally excluded — it is fixed at both RX ports server-side
+// (make_capture) because the two-waterfall UI depends on it (P1-2). The four
+// analysis knobs are now wired through to the radio on the next re-arm.
 const captureFields = [
     "center_frequency", "sample_rate", "gain", "duration", "analysis_bandwidth",
-    "port", "lo_shift", "host_resample", "backend_sample_rate",
+    "lo_shift", "host_resample", "backend_sample_rate",
 ];
 const sourceFields = [
     "master_clock_rate", "trigger_strobe", "signal_trigger", "array_backend",

@@ -375,3 +375,29 @@ state. The box stays checked by default.
 **Verify [demo]:** calibrated mode — box checked → center stripe blanked; unchecked → the LO
 spike (real hardware DC leakage) is visible at band center. In `--demo` (no synthetic DC tone)
 the center stripe darkens to the row-min when checked and shows noise when unchecked.
+
+### P1-2 — Wire the four "dead" capture fields so they actually apply
+**Files:** `live/striqt_web_server.py`, `live/web/app.js`
+**Changed:** `make_capture` used to hardcode `host_resample=False`,
+`analysis_bandwidth=inf`, `lo_shift="none"`, `backend_sample_rate=sample_rate`, so those four
+schema-editor fields were rendered but ignored. Added them to `RadioConfig` (defaults reproduce
+the old hardcoded values: `analysis_bandwidth=inf`, `lo_shift="none"`, `host_resample=False`,
+`backend_sample_rate=0.0` where 0 ⇒ "track sample_rate") and to `snapshot()`. In
+`SharedConfig.update` they pass through the `capture` branch (same field names → `mapped`), were
+added to `capture_mapped` (so they're no longer reported as "ignored") and to `valid`, with light
+validation: `analysis_bandwidth` must be `>0` or `inf`; `lo_shift` ∈ `{left,right,none}` (read
+from striqt `types.LOShift = Literal['left','right','none']`); `host_resample` coerced to bool;
+`backend_sample_rate` `0` or a positive float. Changing any sets `_dirty` (takes effect on the
+next re-arm, like `sample_rate`). `make_capture` now reads `cfg.analysis_bandwidth`,
+`cfg.lo_shift`, `cfg.host_resample`, and `cfg.backend_sample_rate or cfg.sample_rate`. **`port`
+stays fixed at `CHANNELS`** (two-waterfall UI depends on it) and is **excluded** from the editable
+`captureFields` list in `app.js`; the four wired fields remain editable.
+**Note:** striqt raises `ValueError('lo_shift requires host_resample=True')` if `lo_shift != none`
+without `host_resample`; that coupling is left to the operator (a bad combo surfaces as a compute
+error in the server log, not a crash — `compute_blocks` is wrapped).
+
+**Verify [hardware]:** changing `lo_shift` moves where the center notch sits; narrowing
+`analysis_bandwidth` trims the band edges. **Verify [demo]:** apply values from the Capture form —
+the `applied` ack lists `analysis_bandwidth/lo_shift/host_resample/backend_sample_rate`, `ignored`
+no longer lists them, and no error occurs (a local `SharedConfig.update` check confirms valid
+values are applied and `lo_shift="sideways"` / `analysis_bandwidth=-3` are rejected).
