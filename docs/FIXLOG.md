@@ -852,3 +852,26 @@ subclass-override is the only non-Deepwave path), phased plan P3-1…P3-6, risks
 checklists for both radios, and the do-NOT list.
 
 **Verify [demo]:** doc-only — no code change; `git show --stat` touches only `docs/`.
+
+### P3-1 — Device profiles + `--device` CLI (AIR8201B, PlutoSDR, demo behind one switch)
+**Files:** `live/striqt_web_server.py`
+**Changed:** Added a data-only `DEVICE_PROFILES` table (channels tuple, label, RadioConfig
+default seeds, capability-envelope fallback + `query_envelope` flag) and `DEVICE`/
+`DEVICE_LABEL` globals resolved once in `main()` before any thread or `SharedConfig`
+exists. New `--device {air8201b, pluto, demo, auto}` (default `air8201b` — a bare launch is
+unchanged); `--demo` stays as an alias for `--device demo` and errors if it contradicts an
+explicit real device. `auto` enumerates SoapySDR (`SoapyAIRT`→air8201b, `plutosdr`→pluto),
+picks a single supported radio, else prints the enumeration and exits. Ported `PlutoSource`
+verbatim from `live/pluto_standalone.py` (driver `plutosdr` via direct `SoapySource.__init__`,
+skipping the AIR-T FPGA-register write; `get_id`/`read_peripherals` overridden), defined
+only when striqt's SoapySource imports. `make_source()` now dispatches on `DEVICE` (pluto =
+`PlutoSource(spec)` + `.setup()`; air8201b = unchanged `from_spec`). `SharedConfig` seeds
+center/rate/gain from the profile (identical values for air8201b/demo). Pluto profile
+defaults to 3.84 MS/s (USB headroom).
+
+**Verify [demo]:** `python -m py_compile` passes; `--help` shows the new flag; both `--demo`
+and `--device demo` boot on port 8001 and `GET /config` returns the unchanged defaults
+(1955 MHz / 15.36 MS/s / gain 0) — done here, passes. **Verify [hardware]:** bare launch on
+the Jetson identical to Phase 2b (banner now says "AIR8201B radio" from the profile label);
+`--device pluto` on a Pluto host opens/arms/streams; `--device auto` resolves correctly on
+each host.

@@ -79,6 +79,10 @@ try:
     from striqt.sensor import specs
     from striqt.sensor.lib.sources.deepwave import Air8201BSourceSpec, Airstack1Source
     try:
+        from striqt.sensor.lib.sources.soapy import SoapySource as _SoapySource
+    except Exception:
+        _SoapySource = None
+    try:
         from striqt.sensor.lib.sources.soapy import ReceiveStreamError
     except Exception:
         try:
@@ -91,6 +95,7 @@ except Exception as _sensor_err:
     specs = None
     Air8201BSourceSpec = None
     Airstack1Source = None
+    _SoapySource = None
     ReceiveStreamError = OSError
 
 # striqt analysis (calibrated spectrogram — optional, falls back to quicklook)
@@ -123,6 +128,65 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Device profiles (P3-1). One entry per supported SDR; data only — the source
+# factories live in make_source(). DEVICE/DEVICE_LABEL/CHANNELS are resolved
+# once in main() from --device, before any thread or SharedConfig exists;
+# every later read is runtime, so set-once is safe. Default stays air8201b so
+# a bare launch on the Jetson is byte-identical to Phase 2b.
+#
+#   channels        RX port tuple the acquirer streams
+#   defaults        RadioConfig seeds (center / sample_rate / gain)
+#   envelope        capability fallback: tier-1 clamp bounds (P3-3)
+#   query_envelope  True → ask the live SoapySDR device for its real ranges
+#                   after open and merge them over the fallback. False for
+#                   air8201b/demo: their fallback IS today's exact clamp
+#                   numbers (the −60..10 gain window is a striqt calibrated-
+#                   gain convention, not the raw SoapyAIRT range — querying
+#                   would shift legal bounds on the existing deployment).
+# ---------------------------------------------------------------------------
+
+DEVICE_PROFILES = {
+    "air8201b": {
+        "label": "AIR8201B",
+        "channels": (0, 1),
+        "defaults": {"center": 1955e6, "sample_rate": 15.36e6, "gain": 0.0},
+        "envelope": {
+            "freq_min": 300e6, "freq_max": 6e9,
+            "gain_min": -60.0, "gain_max": 10.0,
+            "rate_min": 1e6,   "rate_max": 125e6,
+        },
+        "query_envelope": False,
+    },
+    "pluto": {
+        "label": "PlutoSDR",
+        "channels": (0,),
+        # 3.84 MS/s default: sustained 15.36 MS/s over the Pluto's USB link is
+        # optimistic; start on the safe LTE grid point and let the user go up.
+        "defaults": {"center": 1955e6, "sample_rate": 3.84e6, "gain": 0.0},
+        "envelope": {
+            "freq_min": 325e6,  "freq_max": 3.8e9,
+            "gain_min": 0.0,    "gain_max": 73.0,
+            "rate_min": 0.52e6, "rate_max": 61.44e6,
+        },
+        "query_envelope": True,
+    },
+    "demo": {
+        "label": "Demo (synthetic IQ)",
+        "channels": (0, 1),
+        "defaults": {"center": 1955e6, "sample_rate": 15.36e6, "gain": 0.0},
+        "envelope": {
+            "freq_min": 300e6, "freq_max": 6e9,
+            "gain_min": -60.0, "gain_max": 10.0,
+            "rate_min": 1e6,   "rate_max": 125e6,
+        },
+        "query_envelope": False,
+    },
+}
+
+DEVICE       = "air8201b"
+DEVICE_LABEL = DEVICE_PROFILES[DEVICE]["label"]
 
 CHANNELS = (0, 1)
 
@@ -897,7 +961,16 @@ class RadioConfig:
 class SharedConfig:
     def __init__(self):
         self._lock  = threading.Lock()
-        self._cfg   = RadioConfig(backend=SPEC_BACKEND)
+        # Seed the radio knobs from the active device profile (P3-1). For
+        # air8201b/demo the profile defaults equal the DEFAULT_* constants,
+        # so behaviour is unchanged there.
+        _prof = DEVICE_PROFILES[DEVICE]["defaults"]
+        self._cfg   = RadioConfig(
+            backend=SPEC_BACKEND,
+            center=_prof["center"],
+            sample_rate=_prof["sample_rate"],
+            gain=_prof["gain"],
+        )
         self._dirty = False
         self._stop  = False
         # P2a-3 backstop state: the analysis params of the last config that
@@ -1799,8 +1872,38 @@ def stream_buffers_for(source, samples):
 # Source / capture factories
 # ---------------------------------------------------------------------------
 
-def make_source():
-    source_spec = Air8201BSourceSpec(
+if _SENSOR_OK and _SoapySource is not None:
+    class PlutoSource(Airstack1Source):
+        """
+        PlutoSDR adapter (ported from live/pluto_standalone.py, P3-1).
+
+        Subclasses Airstack1Source to reuse all of its striqt stream/arm/read
+        machinery, but overrides __init__ to call SoapySource.__init__ directly.
+        This skips two things in Airstack1Source.__init__ that crash on a Pluto:
+          1. driver='SoapyAIRT'  -- replaced with driver='plutosdr'
+          2. _set_jesd_sysref_delay()  -- AIR-T FPGA register write, absent on Pluto
+        get_id/read_peripherals are overridden because the AirStack versions read
+        the Jetson eth0 MAC and an AirStack-only temperature sensor.
+        striqt/ itself is never modified.
+        """
+
+        def __init__(self, spec, **kwargs):
+            _SoapySource.__init__(self, spec, driver="plutosdr", **kwargs)
+
+        def get_id(self):
+            try:
+                return self.device.getHardwareKey()
+            except Exception:
+                return "pluto"
+
+        def read_peripherals(self):
+            return {}
+else:
+    PlutoSource = None
+
+
+def _make_source_spec():
+    return Air8201BSourceSpec(
         master_clock_rate=MASTER_CLOCK_RATE,
         array_backend="numpy",
         time_source="host",
@@ -1809,7 +1912,62 @@ def make_source():
         gapless=True,
         receive_retries=0,
     )
+
+
+def make_source():
+    # Device dispatch (P3-1). The pluto path reuses the AIR8201B spec values —
+    # proven by the standalone POC; the plutosdr Soapy driver ignores the
+    # AirStack master-clock/time-source fields it doesn't implement.
+    source_spec = _make_source_spec()
+    if DEVICE == "pluto":
+        if PlutoSource is None:
+            raise RuntimeError("striqt SoapySource unavailable — cannot drive a PlutoSDR")
+        source = PlutoSource(source_spec)
+        source.setup()
+        return source
     return Airstack1Source.from_spec(source_spec)
+
+
+def _resolve_auto_device():
+    """--device auto: enumerate SoapySDR, pick the single supported radio."""
+    try:
+        import SoapySDR
+    except Exception as e:
+        print(f"ERROR: --device auto needs SoapySDR (import failed: {e})",
+              file=sys.stderr)
+        sys.exit(1)
+    driver_to_device = {"SoapyAIRT": "air8201b", "plutosdr": "pluto"}
+    try:
+        results = SoapySDR.Device.enumerate()
+    except Exception as e:
+        print(f"ERROR: SoapySDR enumeration failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    found = []
+    for r in results:
+        try:
+            info = dict(r)
+        except Exception:
+            info = {}
+        name = driver_to_device.get(str(info.get("driver", "")))
+        if name:
+            found.append((name, info))
+    if len(found) == 1:
+        name, info = found[0]
+        label = info.get("label") or info.get("driver") or name
+        print(f"[device] auto-detected {name} ({label})")
+        return name
+    print(
+        f"ERROR: --device auto found {len(found)} supported radios "
+        f"(need exactly 1). Enumeration:",
+        file=sys.stderr,
+    )
+    for r in results:
+        try:
+            print(f"  {dict(r)}", file=sys.stderr)
+        except Exception:
+            print(f"  {r}", file=sys.stderr)
+    print("  Pick one explicitly: --device air8201b | pluto | demo", file=sys.stderr)
+    sys.exit(1)
 
 def make_capture(cfg):
     # port stays fixed at CHANNELS — the two-waterfall UI depends on both RX ports
@@ -3271,13 +3429,19 @@ else:
 
 def main():
     global _acquirer, _computer, _shared, _quantize, BROADCAST_FPS, SPEC_BACKEND
+    global DEVICE, DEVICE_LABEL, CHANNELS
 
     parser = argparse.ArgumentParser(
         description="striqt WebSocket live viewer server",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--device",   default="air8201b",
+                        choices=("air8201b", "pluto", "demo", "auto"),
+                        help="SDR to drive (auto = enumerate SoapySDR, pick the "
+                             "single supported radio)")
     parser.add_argument("--demo",     action="store_true",
-                        help="Use synthetic IQ (no radio hardware)")
+                        help="Use synthetic IQ (no radio hardware); alias for "
+                             "--device demo")
     parser.add_argument("--quantize", action="store_true",
                         help="Encode waterfall as uint8 (~4x smaller frames)")
     parser.add_argument("--fps",      type=float, default=BROADCAST_FPS,
@@ -3291,13 +3455,28 @@ def main():
                         help="Listen port")
     args = parser.parse_args()
 
-    if args.demo and not _ANALYSIS_OK and args.backend in CALIBRATED_GRID_BACKENDS:
+    # Resolve the device first (P3-1): --demo remains the historical alias and
+    # may not contradict an explicit real --device choice.
+    device = args.device
+    if args.demo:
+        if device not in ("air8201b", "demo"):
+            parser.error(f"--demo conflicts with --device {device}")
+        device = "demo"
+    if device == "auto":
+        device = _resolve_auto_device()
+    DEVICE       = device
+    profile      = DEVICE_PROFILES[DEVICE]
+    DEVICE_LABEL = profile["label"]
+    CHANNELS     = tuple(profile["channels"])
+    is_demo      = DEVICE == "demo"
+
+    if is_demo and not _ANALYSIS_OK and args.backend in CALIBRATED_GRID_BACKENDS:
         print("[demo] striqt.analysis unavailable; falling back to quicklook backend")
         SPEC_BACKEND = "quicklook"
     else:
         SPEC_BACKEND = args.backend
 
-    if not args.demo and not _SENSOR_OK:
+    if not is_demo and not _SENSOR_OK:
         print(
             "ERROR: striqt.sensor not importable (radio hardware deps missing).\n"
             "  Run with --demo for synthetic IQ, or install the striqt radio stack.",
@@ -3308,7 +3487,7 @@ def main():
     BROADCAST_FPS = max(args.fps, 0.5)
     _quantize     = args.quantize
     _shared       = SharedConfig()
-    if args.demo:
+    if is_demo:
         # DemoAcquirer generates synthetic IQ and self-publishes — no DMA to
         # overflow, so it keeps the inline-compute path and needs no Computer.
         _acquirer = DemoAcquirer(_shared)
@@ -3326,7 +3505,7 @@ def main():
         )
         sys.exit(1)
 
-    mode    = "DEMO (synthetic IQ)" if args.demo else "AIR8201B radio"
+    mode    = "DEMO (synthetic IQ)" if is_demo else f"{DEVICE_LABEL} radio"
     q_note  = " + uint8 quantization" if _quantize else ""
     print(f"\nstriqt web viewer — {mode}")
     print(f"  backend={SPEC_BACKEND}, fps={BROADCAST_FPS:.0f}{q_note}")
