@@ -88,6 +88,33 @@ function channelsKey(list) {
     return list.join(",");
 }
 
+// Device identity (P3-5): the server ships its device label in every frame
+// header ("device") and in /config (device.label). The page title, brand
+// heading, and subtitle follow it; a cheap key check skips the DOM writes on
+// the (typical) unchanged frame.
+let curDevice = null;        // raw device label, e.g. "AIR8201B"
+let deviceLabelKey = null;   // "<label>|<nchannels>" of the last DOM update
+
+function updateDeviceLabel(label) {
+    if (!label) return;
+    const n = channelList ? channelList.length : null;
+    const key = `${label}|${n}`;
+    if (deviceLabelKey === key) return;
+    deviceLabelKey = key;
+    curDevice = label;
+    document.title = `${label} Live Spectrogram + PSD`;
+    const h1 = document.querySelector("#app-header .brand-text h1");
+    if (h1) h1.textContent = `${label} Live Viewer`;
+    const sub = document.querySelector("#app-header .brand-text p");
+    if (sub) {
+        const rx = n === 1 ? "single receiver"
+                 : n === 2 ? "dual receiver"
+                 : n       ? `${n} receivers`
+                 : null;
+        sub.textContent = rx ? `Spectrogram & PSD · ${rx}` : "Spectrogram & PSD";
+    }
+}
+
 function firstWfBuf() {
     const chans = channelList || [];
     return chans.length ? wfBuf[chans[0]] : null;
@@ -153,6 +180,7 @@ function updateMeta() {
         ? `integration ${curSpanMs.toFixed(0)} ms (${serverStats.map(statLabel).join("/")})`
         : `window ${winMs} ms (${depthRows} rows)`;
     metaEl.textContent = (
+        (curDevice ? `${curDevice} | ` : "") +
         `LIVE | center ${(curCenter / 1e6).toFixed(3)} MHz | ` +
         `span ${(curFs / 1e6).toFixed(2)} MS/s | ` +
         `FFT ${fftLabel} | ${analysis} | ${mode} | ${winLabel} | ` +
@@ -341,6 +369,7 @@ function onFrame(data) {
     // (Re)build the per-channel panes/buffers when the header's channel set
     // differs from the current display (P3-4) — a no-op on every other frame.
     ensureChannels(channels);
+    updateDeviceLabel(header.device);
     let offset = 4 + hdrLen;
 
     // ── Parse blocks ──────────────────────────────────────────────────────
@@ -1628,6 +1657,7 @@ async function fetchConfig() {
 }
 
 function seedStaticControls(config) {
+    if (config && config.device) updateDeviceLabel(config.device.label);
     const cap = (config && config.capture) || {};
     if (cap.nfft) {
         radioNfft = cap.nfft;   // /config re-sync — the other radioNfft updater
@@ -1655,10 +1685,27 @@ function seedStaticControls(config) {
 
 function seedCaptureForm(config) {
     const cap = (config && config.capture) || {};
+    // Device capability envelope (P3-5): display-only min/max attributes +
+    // tooltips on the live radio knobs. The server's freedom-model clamps
+    // remain authoritative — an out-of-range entry is still sent and comes
+    // back as a "rounded" ack; these hints just make the range visible.
+    const env = (config && config.envelope) || null;
+    const hints = env ? {
+        center_frequency: [env.freq_min, env.freq_max, "Hz"],
+        gain:             [env.gain_min, env.gain_max, "dB"],
+        sample_rate:      [env.rate_min, env.rate_max, "S/s"],
+    } : null;
     document.querySelectorAll("#capture-settings-form input, #capture-settings-form select")
         .forEach((input) => {
             const name = input.dataset.field;
             if (name in cap) setFieldValue(input, cap[name]);
+            const hint = hints && hints[name];
+            if (hint && input.tagName === "INPUT" && input.type === "number") {
+                const [lo, hi, unit] = hint;
+                if (lo !== undefined && lo !== null) input.min = lo;
+                if (hi !== undefined && hi !== null) input.max = hi;
+                input.title = `device range: ${lo} – ${hi} ${unit}`;
+            }
         });
 }
 

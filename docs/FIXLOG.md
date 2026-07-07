@@ -944,3 +944,21 @@ labels, diff trace present); `--channels 1` → one full-width pane, single PSD 
 diff/Δ/Q; `--channels 3` → three panes + 12 series, CSV/PNG contain 3 channels, no console
 errors; DAN/ARIC toggle and all four Analysis modes work in each. **Verify [hardware]:**
 Pluto shows the single-pane UI live; AIR8201B view unchanged.
+
+### P3-5 — Device identity in the UI + envelope hints on the capture form
+**Files:** `live/web/index.html`, `live/web/app.js`
+**Changed:** The static "AIR8201" branding is gone: index.html ships neutral fallbacks
+("Live Spectrogram + PSD" / "Live Viewer" / "Spectrogram & PSD") and a new
+`updateDeviceLabel(label)` sets `document.title`, the brand `h1`, and the subtitle
+(single/dual/N receivers) from the frame header's `device` field and `/config`'s
+`device.label` (keyed no-op on unchanged frames). The meta bar now leads with the device
+label. `seedCaptureForm` applies the `/config` `envelope` as display-only `min`/`max`
+attributes + range tooltips on the center/gain/sample-rate number inputs — the server's
+freedom-model clamps stay authoritative (out-of-range entries still round-trip as
+"rounded" acks).
+
+**Verify [demo]:** `node --check` passes; demo server → tab title and header read
+"Demo (synthetic IQ)", subtitle "dual receiver" (or "single receiver" with `--channels 1`),
+meta line leads with the label; DAN capture form inputs show `min`/`max` + a "device range"
+tooltip matching `/config.envelope`. **Verify [hardware]:** AIR8201B shows "AIR8201B";
+Pluto shows "PlutoSDR · single receiver" and queried envelope numbers in the tooltips.
