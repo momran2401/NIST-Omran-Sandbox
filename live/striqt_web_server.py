@@ -232,6 +232,18 @@ def _snap(value, choices):
     return min(choices, key=lambda c: abs(c - value))
 
 
+def allowed_rates(env):
+    """
+    LTE-grid rates within the device capability envelope (P3-3). The grid is
+    domain logic (cellular multiples of 1.92 MHz), not a device property; the
+    envelope only filters it. Falls back to the full grid if the intersection
+    is empty so snapping never faces an empty choice list.
+    """
+    rates = tuple(r for r in RATES_HZ
+                  if env["rate_min"] <= r <= env["rate_max"])
+    return rates or RATES_HZ
+
+
 WEB_DIR = Path(__file__).parent / "web"
 
 # Backend: "calibrated" (striqt PSD/ENBW dB spectrogram), "quicklook" (simple
@@ -981,6 +993,10 @@ class SharedConfig:
             sample_rate=_prof["sample_rate"],
             gain=_prof["gain"],
         )
+        # Capability envelope (P3-3): tier-1 clamp bounds. Starts as the
+        # profile fallback; when the profile opts in (query_envelope) the
+        # Acquirer merges the live device's queried ranges over it after open.
+        self._envelope = dict(DEVICE_PROFILES[DEVICE]["envelope"])
         self._dirty = False
         self._stop  = False
         # P2a-3 backstop state: the analysis params of the last config that
@@ -1000,6 +1016,29 @@ class SharedConfig:
     def snapshot(self):
         with self._lock:
             return self._cfg.snapshot()
+
+    # --- Capability envelope (P3-3) -------------------------------------------
+
+    def set_envelope(self, env: dict):
+        """Merge queried device bounds over the profile fallback. Partial
+        dicts are fine — unanswered keys keep their fallback values."""
+        clean = {}
+        for key, value in (env or {}).items():
+            if key not in self._envelope or value is None:
+                continue
+            try:
+                clean[key] = float(value)
+            except (TypeError, ValueError):
+                continue
+        if not clean:
+            return
+        with self._lock:
+            self._envelope.update(clean)
+        print(f"[device] capability envelope updated: {clean}")
+
+    def envelope(self):
+        with self._lock:
+            return dict(self._envelope)
 
     # --- Compute backstop (P2a-3) ---------------------------------------------
 
@@ -1095,10 +1134,13 @@ class SharedConfig:
         mapped to the top level by the capture branch), not the stale cfg.
         """
         eff = self.snapshot()
+        env = self.envelope()
         try:
             if update.get("sample_rate") is not None:
                 eff.sample_rate = float(
-                    max(1e6, min(_snap(float(update["sample_rate"]), RATES_HZ), 125e6))
+                    max(env["rate_min"],
+                        min(_snap(float(update["sample_rate"]), allowed_rates(env)),
+                            env["rate_max"]))
                 )
             if update.get("nfft") is not None:
                 eff.nfft = int(_snap(int(update["nfft"]), NFFT_CHOICES))
@@ -1629,6 +1671,10 @@ class SharedConfig:
         } | ANALYSIS_CFG_KEYS
         changes = []
         with self._lock:
+            # Device capability bounds for this message's clamps (P3-3).
+            # Read directly — self._lock is already held (envelope() would
+            # re-take it).
+            env = self._envelope
             # Effective backend/SCS for THIS message: an SSB-grid rate (e.g. the
             # retuned 13.44 MS/s coming back from a server-seeded form) must not
             # be snapped onto the LTE list only for the SSB retune to undo it —
@@ -1687,14 +1733,14 @@ class SharedConfig:
                 if key == "rows":
                     value = int(max(1, min(value, max_live_rows(self._cfg))))
                 elif key == "center":
-                    value = float(max(300e6, min(value, 6e9)))
+                    value = float(max(env["freq_min"], min(value, env["freq_max"])))
                 elif key == "sample_rate":
                     value = float(value)
                     if not (eff_backend == "ssb" and ssb_grid_compatible(value, eff_scs)):
-                        value = float(_snap(value, RATES_HZ))
-                    value = float(max(1e6, min(value, 125e6)))
+                        value = float(_snap(value, allowed_rates(env)))
+                    value = float(max(env["rate_min"], min(value, env["rate_max"])))
                 elif key == "gain":
-                    value = float(max(-60.0, min(value, 10.0)))
+                    value = float(max(env["gain_min"], min(value, env["gain_max"])))
                 elif key == "nfft":
                     value = int(_snap(value, NFFT_CHOICES))
                     value = int(max(128, min(value, 8192)))
@@ -1876,6 +1922,60 @@ def stream_buffers_for(source, samples):
     rx    = get_rx_stream(source)
     ports = tuple(getattr(rx, "ports", CHANNELS))
     return [samples[CHANNELS.index(p)].view(np.float32) for p in ports], ports
+
+
+def query_device_envelope(source):
+    """
+    Ask the open SoapySDR device for its real capability ranges (P3-3).
+    Returns a partial envelope dict — only the keys the device answered — to
+    be merged over the profile fallback by SharedConfig.set_envelope. Every
+    step is defensive: a missing method, failed call, or odd range-object
+    shape just drops that key (the fallback bound stays in force).
+    """
+    dev = get_device(source)
+    if dev is None:
+        return {}
+    try:
+        from SoapySDR import SOAPY_SDR_RX as _rx_dir
+    except Exception:
+        _rx_dir = 1   # SoapySDR's RX direction constant
+    ch = CHANNELS[0] if CHANNELS else 0
+
+    def _bounds(ranges):
+        lows, highs = [], []
+        for r in ranges:
+            try:
+                lows.append(float(r.minimum()))
+                highs.append(float(r.maximum()))
+            except Exception:
+                try:
+                    lows.append(float(r[0]))
+                    highs.append(float(r[1]))
+                except Exception:
+                    pass
+        if lows and highs:
+            return min(lows), max(highs)
+        return None
+
+    env = {}
+    for method, lo_key, hi_key in (
+        ("getFrequencyRange",  "freq_min", "freq_max"),
+        ("getGainRange",       "gain_min", "gain_max"),
+        ("getSampleRateRange", "rate_min", "rate_max"),
+    ):
+        fn = getattr(dev, method, None)
+        if fn is None:
+            continue
+        try:
+            ranges = fn(_rx_dir, ch)
+        except Exception:
+            continue
+        if not isinstance(ranges, (list, tuple)):
+            ranges = [ranges]   # getGainRange returns a single Range object
+        got = _bounds(ranges)
+        if got:
+            env[lo_key], env[hi_key] = got
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -2798,6 +2898,15 @@ class Acquirer(threading.Thread):
         enable_stream(self.source, True)
         self.stream_mtu   = get_stream_mtu(self.source)
         self.stream_ports = get_stream_ports(self.source)
+        # Capability envelope (P3-3): profiles that opt in get their tier-1
+        # clamp bounds from the live device. Failure is non-fatal — the
+        # profile fallback stays in force. _recover() reopens through here,
+        # so the envelope survives recovery cycles.
+        if DEVICE_PROFILES[DEVICE].get("query_envelope"):
+            try:
+                self.shared.set_envelope(query_device_envelope(self.source))
+            except Exception as e:
+                print(f"[device] envelope query failed (profile fallback kept): {e}")
         print(
             f"[radio] armed: center {cfg.center/1e6:.2f} MHz, "
             f"{cfg.sample_rate/1e6:.3f} MS/s, channels {CHANNELS}, "
@@ -3257,6 +3366,7 @@ def current_config():
             "label":    DEVICE_LABEL,
             "channels": list(CHANNELS),
         },
+        "envelope": _shared.envelope(),
         "backend": str(cfg.backend),
         "rows":    int(cfg.rows),
         "lo_null": bool(cfg.lo_null),

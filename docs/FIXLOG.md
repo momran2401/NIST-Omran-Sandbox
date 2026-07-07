@@ -892,3 +892,26 @@ P3-4 because the current frontend crashes on 3+ channels). `build_header` now sh
 `device: demo / Demo (synthetic IQ) / channels: [0]` — done here, passes. Browser check:
 RX1 pane streams, RX2 pane freezes gracefully, no console errors (pre-P3-4 behavior).
 **Verify [hardware]:** none (demo + additive metadata only; real devices ignore --channels).
+
+### P3-3 — Device capability envelope: tier-1 clamps read the radio, not AIR-T constants
+**Files:** `live/striqt_web_server.py`
+**Changed:** New `query_device_envelope(source)` asks the open SoapySDR device for its real
+RX ranges (`getFrequencyRange`/`getGainRange`/`getSampleRateRange`, per-key defensive, range
+objects read via `.minimum()/.maximum()` with a tuple fallback). `SharedConfig` now carries
+`_envelope` (seeded from the profile fallback) with lock-guarded `set_envelope()` (partial
+merge — unanswered keys keep the fallback) and `envelope()`. `Acquirer.open_radio` merges
+the queried ranges after stream enable, only for profiles with `query_envelope=True`
+(pluto); failure is non-fatal and `_recover()` re-sets it on reopen. The three tier-1
+clamp sites in `SharedConfig.update` (center 300e6–6e9, gain −60..10, rate 1e6..125e6) and
+`_effective_radio` now read the envelope instead of literals, and the `RATES_HZ` snap uses
+`allowed_rates(env)` = LTE grid ∩ envelope (full grid if empty). The SSB-grid rate bypass,
+tier-2 scratch validators, and tier-3 backstop are untouched. `/config` gains an additive
+`"envelope"` block. air8201b/demo envelopes are today's exact numbers with no query, so ack
+behavior on the existing deployment is byte-identical.
+
+**Verify [demo]:** WS probe against `--device demo`: `/config` shows the envelope; sending
+`{"center": 1e6, "gain": 99}` lands as center 300e6 / gain 10.0 — identical to pre-P3
+clamping (done here, passes). **Verify [hardware]:** on a Pluto, server log prints
+`[device] capability envelope updated: {...}` with sane values (freq ~0.325–3.8 GHz, gain
+0–73); gain/center/rate acks clamp to those; on the AIR8201B no query runs (by design) and
+clamps behave exactly as Phase 2b.
