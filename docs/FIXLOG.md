@@ -962,3 +962,15 @@ freedom-model clamps stay authoritative (out-of-range entries still round-trip a
 meta line leads with the label; DAN capture form inputs show `min`/`max` + a "device range"
 tooltip matching `/config.envelope`. **Verify [hardware]:** AIR8201B shows "AIR8201B";
 Pluto shows "PlutoSDR · single receiver" and queried envelope numbers in the tooltips.
+
+### P3-6 — Multi-SDR docs, run_web.sh --device usage, hardware validation checklist
+**Files:** `live/run_web.sh`, `docs/PHASE3_PLAN.md`
+**Changed:** `run_web.sh` header documents the `--device air8201b|pluto|auto` and
+`--channels` passthrough (the script already forwards `"$@"` — no logic change).
+`docs/PHASE3_PLAN.md` gained §8 "Execution results": what was verified on the dev box
+(`[demo]`) and the ordered human checklist — browser pass on the demo server, AIR8201B
+regression on the Jetson, PlutoSDR bring-up (envelope query, 1-ch UI, rate stress,
+USB-recover, auto-detect).
+
+**Verify [demo]:** `bash -n live/run_web.sh` passes; final demo smoke green (server boots,
+/config + WS stream OK). **Verify [hardware]:** the §8 checklist itself.

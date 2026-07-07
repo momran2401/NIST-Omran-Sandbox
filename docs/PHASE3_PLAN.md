@@ -196,7 +196,35 @@ doesn't break anything; `--device auto` resolves to pluto on the Pi.
 AD9361-legal); whether the 61.44 MS/s grid point should ever be offered (it is outside
 `RATES_HZ` today; unchanged).
 
-## 8. Do NOT do
+## 8. Execution results (P3-6, 2026-07-07) and hardware validation checklist
+
+All phases P3-0…P3-6 are implemented and committed. What was verified on the
+dev box (`[demo]`, no radio, no striqt install): py_compile + `node --check`
+green after every commit; `--device demo`, `--demo`, and `--channels 1|3`
+boot and stream; `/config` carries `device` + `envelope`; the WS clamp
+round-trip (`center 1e6 → 300e6`, `gain 99 → 10`) is byte-identical to
+Phase 2b; frame headers carry `device` and the true channel list.
+
+**Remaining human checks, in order:**
+
+1. `[demo]` browser pass (any machine with a browser): default 2-ch view
+   pixel-identical (colors/legend order/labels/diff trace); `--channels 1`
+   single full-width pane with no diff/Δ/Q; `--channels 3` three panes with
+   12 PSD series; CSV/PNG exports match the channel count; DAN/ARIC toggle
+   and all four Analysis modes in each; title reads "Demo (synthetic IQ)".
+2. `[hardware]` AIR8201B regression (Jetson): bare launch identical to
+   Phase 2b (banner label aside); retune/gain acks unchanged; `/config`
+   envelope equals the old hardcoded numbers (no live query by design);
+   `--device auto` resolves to air8201b.
+3. `[hardware]` PlutoSDR bring-up (Pi/laptop with SoapyPlutoSDR):
+   `--device pluto` opens/arms/streams; log prints
+   `[device] capability envelope updated: {...}` with sane values
+   (freq ≈ 0.325–3.8 GHz, gain 0–73); 1-ch UI; capture-form tooltips show
+   the queried ranges; sustained 3.84 MS/s, then try 15.36 MS/s (watch
+   overflow logging); unplug/replug USB → `_recover` loop reopens;
+   `--device auto` resolves to pluto.
+
+## 9. Do NOT do
 
 - Do **not** edit anything under `striqt/` — read-only vendored dependency.
 - Do **not** build a second validator — the envelope feeds the existing tier-1 clamps;
