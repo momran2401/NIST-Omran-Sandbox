@@ -3567,9 +3567,9 @@ def main():
     parser.add_argument("--demo",     action="store_true",
                         help="Use synthetic IQ (no radio hardware); alias for "
                              "--device demo")
-    # choices gate widened to 1-4 when the frontend goes channel-dynamic (P3-4):
-    # the current UI crashes on 3+ channels (fixed wfCanvas map).
-    parser.add_argument("--channels", type=int, default=None, choices=(1, 2),
+    # 1-4 channels: the frontend builds its panes/series from the header's
+    # channel list (P3-4); 4 is just a sane demo ceiling, not a hard limit.
+    parser.add_argument("--channels", type=int, default=None, choices=(1, 2, 3, 4),
                         help="Demo-only channel-count override (real devices "
                              "use their profile)")
     parser.add_argument("--quantize", action="store_true",

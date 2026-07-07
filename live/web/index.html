@@ -190,23 +190,19 @@
         <div id="band-monitor">Band monitor: --</div>
     </section>
 
-    <!-- Waterfalls -->
-    <section id="waterfall-row">
-        <div class="wf-pane" id="wf-pane-0">
-            <div class="wf-title"><span class="dot dot-rx1"></span>Spectrogram Port 0 — RX1</div>
+    <!-- Waterfalls — one pane per channel, cloned from the template by
+         app.js ensureChannels() so the layout follows the frame header's
+         channel list (P3-4). -->
+    <section id="waterfall-row"></section>
+    <template id="wf-pane-tpl">
+        <div class="wf-pane">
+            <div class="wf-title"><span class="dot"></span><span class="wf-title-text"></span></div>
             <div class="wf-wrap">
-                <canvas class="wf-canvas" id="wf0"></canvas>
+                <canvas class="wf-canvas"></canvas>
                 <div class="wf-freq-axis"></div>
             </div>
         </div>
-        <div class="wf-pane" id="wf-pane-1">
-            <div class="wf-title"><span class="dot dot-rx2"></span>Spectrogram Port 1 — RX2</div>
-            <div class="wf-wrap">
-                <canvas class="wf-canvas" id="wf1"></canvas>
-                <div class="wf-freq-axis"></div>
-            </div>
-        </div>
-    </section>
+    </template>
 
     <!-- PSD plot -->
     <section class="panel" id="psd-row">

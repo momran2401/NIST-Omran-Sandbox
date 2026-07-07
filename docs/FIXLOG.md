@@ -915,3 +915,32 @@ clamping (done here, passes). **Verify [hardware]:** on a Pluto, server log prin
 `[device] capability envelope updated: {...}` with sane values (freq ~0.325–3.8 GHz, gain
 0–73); gain/center/rate acks clamp to those; on the AIR8201B no query runs (by design) and
 clamps behave exactly as Phase 2b.
+
+### P3-4 — Channel-dynamic frontend: panes, PSD series, band monitor, exports follow header.channels
+**Files:** `live/web/app.js`, `live/web/index.html`, `live/web/style.css`, `live/striqt_web_server.py`
+**Changed:** The UI no longer hardcodes two channels anywhere. New `channelList` state +
+`ensureChannels(channels)` runs at the top of every frame (cheap string-compare no-op when
+unchanged): it clones one waterfall pane per header channel from a new `<template
+id="wf-pane-tpl">` (reproducing the exact former markup classes), rebuilds the
+canvas/context/ImageData maps, resets all per-channel buffers, sets the grid column count
+via a `--wf-cols` custom property (the ≤1000px single-column media query still wins), hides
+the RX1−RX2 diff checkbox unless exactly 2 channels, and forces a uPlot rebuild. New
+`CH_COLORS` palette — indices 0/1 are the historical RX1/RX2 colors verbatim, so the
+two-channel view is pixel-identical; the fixed `COL` map and `.dot-rx1/.dot-rx2` CSS are
+gone (dots colored inline). `initUplot` generates the series set from the channel list in
+the historical order (mean/max per channel, holds, mins, diff iff 2 ch) and stamps
+`uplotKind = "std:<channels>"`; `initUplotPsdStats`/`renderServerPsd` likewise key their
+kind on the channel signature. `updatePSD` assembles data/visibility arrays by the same
+loops; peak markers became a per-channel array (`RX${i+1}` tags in `drawPsdOverlays`); the
+band monitor loops channels and shows Δ/Q only for the 2-channel pair; CSV/PNG exports
+composite N channels; all fixed `buf[0]=buf[1]=null` resets went through a new
+`clearChannelBufs()`. Bootstrap builds the classic 2-pane layout before the first frame.
+Server: `--channels` choices widened to 1–4.
+
+**Verify [demo]:** `node --check` + `py_compile` pass; `--device demo --channels 3` streams
+frames with `channels=[0,1,2]` over the WS (probed here, passes). Browser check (needs the
+demo server + a browser): default 2-ch view renders identically (same colors/legend order/
+labels, diff trace present); `--channels 1` → one full-width pane, single PSD set, no
+diff/Δ/Q; `--channels 3` → three panes + 12 series, CSV/PNG contain 3 channels, no console
+errors; DAN/ARIC toggle and all four Analysis modes work in each. **Verify [hardware]:**
+Pluto shows the single-pane UI live; AIR8201B view unchanged.
