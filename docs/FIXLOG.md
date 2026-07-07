@@ -836,3 +836,19 @@ server-seeded capture values returns `applied []` (no rearm); choosing 7.68 MS/s
 applies-then-retunes with the reported `rounded sample_rate → 13.44e6`; on the calibrated
 backend 13.44 still snaps to 15.36. **Verify [hardware]:** with SSB live, a bare Apply causes
 no waterfall blank/rearm log line.
+
+---
+
+## Phase 3 — Multi-SDR (device profiles, dynamic channels, capability envelope)
+
+### P3-0 — Phase 3 design doc
+**Files:** `docs/PHASE3_PLAN.md`
+**Changed:** Authored the Phase 3 design consultation + execution plan (the planning
+session's deliverable, which was never committed): verdict & scope (AIR8201B + PlutoSDR +
+demo only), launch-flag device selection with opt-in `--device auto` (no browser menu),
+fully dynamic channel count, capability envelope feeding the existing freedom-model tier-1
+clamps, the striqt-binding finding (Deepwave-only hardware bindings; PlutoSource
+subclass-override is the only non-Deepwave path), phased plan P3-1…P3-6, risks, on-hardware
+checklists for both radios, and the do-NOT list.
+
+**Verify [demo]:** doc-only — no code change; `git show --stat` touches only `docs/`.
