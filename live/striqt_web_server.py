@@ -217,6 +217,16 @@ RING_ROW_FILL       = 0.9       # fraction of MAX_TAIL usable for one frame's ne
 RATES_HZ      = (3.84e6, 7.68e6, 15.36e6, 30.72e6)
 NFFT_CHOICES  = (256, 512, 1024, 2048, 4096)
 
+# Demo tone plan (P3-2): per-channel CW tone sets of (amplitude, offset_hz),
+# cycled when the demo runs with more channels than entries. Entries 0/1 are
+# the historical two-channel tone sets, unchanged.
+DEMO_TONES = (
+    ((0.30,  2.5e6), (0.12, -1.8e6)),
+    ((0.20, -3.2e6), (0.08,  4.1e6)),
+    ((0.25,  1.1e6), (0.10, -4.6e6)),
+    ((0.15, -0.9e6), (0.09,  3.3e6)),
+)
+
 
 def _snap(value, choices):
     return min(choices, key=lambda c: abs(c - value))
@@ -2629,6 +2639,7 @@ def build_header(cfg: RadioConfig, blocks: list, meta: dict, demo: bool = False)
         "rows":          int(rows),
         "shape":         [int(rows), int(bins)],
         "channels":      list(CHANNELS),
+        "device":        DEVICE_LABEL,
         "backend":       executed,
         "fft_nfft":      fft_nfft,
         "bin_avg":       bin_avg,
@@ -3013,23 +3024,22 @@ class DemoAcquirer(threading.Thread):
             n   = samples_needed(cfg)
             t   = np.arange(n, dtype=np.float32) / cfg.sample_rate
 
-            # Channel 0: two tones offset from center
-            sig0 = (
-                0.30 * np.exp(2j * np.pi *  2.5e6 * t) +
-                0.12 * np.exp(2j * np.pi * -1.8e6 * t)
-            ).astype(np.complex64)
-            noise0 = (rng.standard_normal(n) + 1j * rng.standard_normal(n)
-                      ).astype(np.complex64) * 0.04
+            # One tone set + noise per channel (P3-2). The per-channel order
+            # (tones, then that channel's noise draw) matches the old fixed
+            # two-channel code exactly, so the default 2-ch demo is
+            # bit-identical to before.
+            chans = []
+            for i in range(len(CHANNELS)):
+                tones = DEMO_TONES[i % len(DEMO_TONES)]
+                sig = sum(
+                    amp * np.exp(2j * np.pi * offset_hz * t)
+                    for amp, offset_hz in tones
+                ).astype(np.complex64)
+                noise = (rng.standard_normal(n) + 1j * rng.standard_normal(n)
+                         ).astype(np.complex64) * 0.04
+                chans.append(sig + noise)
 
-            # Channel 1: different tones
-            sig1 = (
-                0.20 * np.exp(2j * np.pi * -3.2e6 * t) +
-                0.08 * np.exp(2j * np.pi *  4.1e6 * t)
-            ).astype(np.complex64)
-            noise1 = (rng.standard_normal(n) + 1j * rng.standard_normal(n)
-                      ).astype(np.complex64) * 0.04
-
-            samples = np.stack([sig0 + noise0, sig1 + noise1])
+            samples = np.stack(chans)
             try:
                 blocks, meta = compute_blocks(samples, cfg)
                 self._publish(cfg, [blocks[i] for i in range(blocks.shape[0])], meta)
@@ -3242,6 +3252,11 @@ def current_config():
             "lo_bandstop":           (float(cfg.ssb_lo_bandstop)
                                       if cfg.ssb_lo_bandstop else None),
         },
+        "device": {
+            "name":     DEVICE,
+            "label":    DEVICE_LABEL,
+            "channels": list(CHANNELS),
+        },
         "backend": str(cfg.backend),
         "rows":    int(cfg.rows),
         "lo_null": bool(cfg.lo_null),
@@ -3442,6 +3457,11 @@ def main():
     parser.add_argument("--demo",     action="store_true",
                         help="Use synthetic IQ (no radio hardware); alias for "
                              "--device demo")
+    # choices gate widened to 1-4 when the frontend goes channel-dynamic (P3-4):
+    # the current UI crashes on 3+ channels (fixed wfCanvas map).
+    parser.add_argument("--channels", type=int, default=None, choices=(1, 2),
+                        help="Demo-only channel-count override (real devices "
+                             "use their profile)")
     parser.add_argument("--quantize", action="store_true",
                         help="Encode waterfall as uint8 (~4x smaller frames)")
     parser.add_argument("--fps",      type=float, default=BROADCAST_FPS,
@@ -3469,6 +3489,11 @@ def main():
     DEVICE_LABEL = profile["label"]
     CHANNELS     = tuple(profile["channels"])
     is_demo      = DEVICE == "demo"
+    if args.channels is not None:
+        if not is_demo:
+            parser.error("--channels is a demo-only override "
+                         "(real devices use their profile)")
+        CHANNELS = tuple(range(args.channels))
 
     if is_demo and not _ANALYSIS_OK and args.backend in CALIBRATED_GRID_BACKENDS:
         print("[demo] striqt.analysis unavailable; falling back to quicklook backend")

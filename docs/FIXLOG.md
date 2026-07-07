@@ -875,3 +875,20 @@ and `--device demo` boot on port 8001 and `GET /config` returns the unchanged de
 the Jetson identical to Phase 2b (banner now says "AIR8201B radio" from the profile label);
 `--device pluto` on a Pluto host opens/arms/streams; `--device auto` resolves correctly on
 each host.
+
+### P3-2 — N-channel demo IQ + device metadata in header + /config
+**Files:** `live/striqt_web_server.py`
+**Changed:** `DemoAcquirer.run` no longer hardcodes two synthetic channels: a module-level
+`DEMO_TONES` table (entries 0/1 are the historical tone sets, verbatim; two extra patterns
+for 3-4 ch) is cycled per channel index and stacked over `len(CHANNELS)`. The per-channel
+compute order (complex128 tone sum → cast, then that channel's noise draw) matches the old
+code exactly, so the default 2-channel demo stream is bit-identical. New demo-only
+`--channels {1,2}` override (argparse-errors on real devices; choices gate widens to 1-4 in
+P3-4 because the current frontend crashes on 3+ channels). `build_header` now ships
+`"device": DEVICE_LABEL` (additive — the client destructures only known keys) and
+`/config` gains `"device": {name, label, channels}`.
+
+**Verify [demo]:** `--device demo --channels 1` boots; `GET /config` shows
+`device: demo / Demo (synthetic IQ) / channels: [0]` — done here, passes. Browser check:
+RX1 pane streams, RX2 pane freezes gracefully, no console errors (pre-P3-4 behavior).
+**Verify [hardware]:** none (demo + additive metadata only; real devices ignore --channels).
