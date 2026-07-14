@@ -162,7 +162,11 @@ h1, h2 { font-weight: 600; }
 .rail-tab:hover  { color: var(--text-dim); }
 .rail-tab.active { color: #eef1f5; border-bottom-color: var(--accent); }
 
-.rail-scroll { flex: 1 1 auto; min-height: 0; overflow: hidden; padding: 10px 14px; }
+/* The one deliberate exception to the no-scroll rule: the inspector tool list
+ * can be taller than the rail (esp. the CAPTURE forms), so this region scrolls
+ * internally. The page/header/footer and the pinned band monitor never move —
+ * only the tool panel scrolls, and only when it actually overflows (auto). */
+.rail-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 10px 14px; }
 .rail-panel { display: none; flex-direction: column; gap: 1px; }
 .rail-panel.active { display: flex; }
 
